@@ -2,71 +2,56 @@
 #include <random>
 #include <time.h>
 #include <Eigen/Dense>
+#include "unittests.h"
+#include "choleskytest.h"
 
 using namespace std;
 using namespace Eigen;
 
-void cholesky(MatrixXd A, MatrixXd& L, int p, int b)
+void cholesky(MatrixXd& A, int p, int b)
 {
 	// p * b = size of A
 	for (int k = 0; k < p; k++)
 	{
-		L.block(k * b, k * b, b, b) = A.block(k * b, k * b, b, b).llt().matrixL();
+		// A.block(k * b, k * b, b, b) = A.block(k * b, k * b, b, b).llt().matrixL();
+		Ref<MatrixXd> Akk = A.block(k * b, k * b, b, b);
+		LLT<Ref<MatrixXd>> llt(Akk);
 		for (int i = k + 1; i < p; i++)
 		{
-			L.block(i * b, k * b, b, b) = A.block(i * b, k * b, b, b) * L.block(k * b, k * b, b, b).inverse().transpose();
+			A.block(i * b, k * b, b, b) = A.block(k * b, k * b, b, b).transpose().triangularView<Upper>().solve<OnTheRight>(A.block(i * b, k * b, b, b));
+			// A.block(i * b, k * b, b, b) = A.block(i * b, k * b, b, b) * A.block(k * b, k * b, b, b).transpose().inverse();
 		}
 		for (int i = k + 1; i < p; i++)
 		{
-			for (int j = k + 1; j < p; j++)
+			for (int j = k + 1; j <= i; j++)
 			{
-				A.block(i * b, j * b, b, b) = A.block(i * b, j * b, b, b) - L.block(i * b, k * b, b, b) * L.block(j * b, k * b, b, b).transpose();
+				A.block(i * b, j * b, b, b) -= A.block(i * b, k * b, b, b) * A.block(j * b, k * b, b, b).transpose();
 			}
 		}
 	}
+	A = A.triangularView<Lower>();
 }
 
 int main()
 {
+	/*
 	srand(time(NULL));
 	
-	MatrixXd testMatrix(4, 4);
-	while (true)
+	int size = 16;
+	MatrixXd testMatrix(size, size);
+	
+	for (int i = 0; i < size; i++)
 	{
-		testMatrix(0, 0) = rand() % 20 - 10;
-		testMatrix(0, 1) = rand() % 20 - 10;
-		testMatrix(0, 2) = rand() % 20 - 10;
-		testMatrix(0, 3) = rand() % 20 - 10;
-		testMatrix(1, 0) = testMatrix(0, 1);
-		testMatrix(1, 1) = rand() % 20 - 10;
-		testMatrix(1, 2) = rand() % 20 - 10;
-		testMatrix(1, 3) = rand() % 20 - 10;
-		testMatrix(2, 0) = testMatrix(0, 2);
-		testMatrix(2, 1) = testMatrix(1, 2);
-		testMatrix(2, 2) = rand() % 20 - 10;
-		testMatrix(2, 3) = rand() % 20 - 10;
-		testMatrix(3, 0) = testMatrix(0, 3);
-		testMatrix(3, 1) = testMatrix(1, 3);
-		testMatrix(3, 2) = testMatrix(2, 3);
-		testMatrix(3, 3) = rand() % 20 - 10;
-		
-		SelfAdjointEigenSolver<MatrixXd> eigensolver(testMatrix);
-		VectorXd values = eigensolver.eigenvalues();
-		
-		bool shouldBreak = true;
-		for (int i = 0; i < 4; i++)
+		for (int j = 0; j < size; j++)
 		{
-			if (values(i) < 0)
-			{
-				shouldBreak = false;
-				break;
-			}
-		}
-		if (shouldBreak)
-		{
-			break;
+			testMatrix(i, j) = rand() % 20 - 10;
 		}
 	}
+	float smallNumber = 0.0005;
+	
+	testMatrix = testMatrix * testMatrix.transpose() + smallNumber * MatrixXd::Identity(size, size);
+	
+	MatrixXd copyTestMatrix(testMatrix);
 	
 	cout << "This is A: " << endl;
 	cout << testMatrix << endl << endl;
@@ -79,24 +64,32 @@ int main()
 	cout << "Real Answer: " << endl;
 	cout << answer << endl << endl;
 	
-	MatrixXd resMatrix(4, 4);
-	for (int i = 0; i < 4; i++)
-	{
-		for (int j = 0; j < 4; j++)
-		{
-			resMatrix(i, j) = 0;
-		}
-	}
-	cholesky(testMatrix, resMatrix, 2, 2);
+	cholesky(testMatrix, 4, 4); // 4 * 4 == 16 == size
 	
 	cout << "Test Answer: " << endl;
-	cout << resMatrix << endl << endl;
+	cout << testMatrix << endl << endl;
 	
 	cout << "This should be A (real answer): " << endl;
 	cout << answer * answer.transpose() << endl << endl;
 	
+	MatrixXd result = testMatrix * testMatrix.transpose();
 	cout << "This should ALSO be A (test answer): " << endl;
-	cout << resMatrix * resMatrix.transpose() << endl << endl;
+	cout << testMatrix * testMatrix.transpose() << endl << endl;
+	
+	MatrixXd errors(size, size);
+	
+	for (int i = 0; i < size; i++)
+	{
+		for (int j = 0; j < size; j++)
+		{
+			errors(i, j) = copyTestMatrix(i, j) - result(i, j);
+		}
+	}
+	cout << "errors:" << endl;
+	cout << errors << endl;
+	*/
+	
+	test();
 	
 	return 0;
 }
