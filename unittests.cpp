@@ -63,7 +63,7 @@ bool test()
 			for (int k = 0; k < size; k++)
 			{
 				double currentError = comp(j, k) - testCopy(j, k);
-				if (currentError > 1e-10)
+				if (currentError > 1e-10 || currentError < -1e-10)
 				{
 					shouldBreak = true;
 					result = false;

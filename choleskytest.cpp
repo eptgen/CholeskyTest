@@ -4,11 +4,18 @@
 #include <Eigen/Dense>
 #include <vector>
 #include <pthread.h>
+#include <thread>
+#include <chrono>
 #include "unittests.h"
 #include "choleskytest.h"
 
 using namespace std;
 using namespace Eigen;
+
+struct flags
+{
+	bool complete;
+};
 
 struct gemm_args
 {
@@ -17,23 +24,28 @@ struct gemm_args
 	int j;
 	int k;
 	int b;
-	bool* complete;
+	flags* f;
 };
 
 void *gemm(void *arguments)
 {
 	gemm_args *args = (gemm_args*) arguments;
 	MatrixXd *A = (MatrixXd*) args->A;
-	int i = (long) args->i;
-	int j = (long) args->j;
-	int k = (long) args->k;
-	int b = (long) args->b;
-	bool *complete = args->complete;
+	int i = args->i;
+	int j = args->j;
+	int k = args->k;
+	int b = args->b;
 	// cout << "A" << i << j << " -= A" << i << k << " * A" << j << k << "^T" << endl;
 	A->block(i * b, j * b, b, b) -= A->block(i * b, k * b, b, b) * A->block(j * b, k * b, b, b).transpose();
-	// cout << "setting complete to true" << endl;
-	complete = new bool(true);
+	// cout << "i=" << i << ", j=" << j << ": setting " << args->f << " from " << args->f->complete << " to 1" << endl;
+	args->f->complete = true;
+	// cout << "done setting complete to " << args->f->complete << endl;
 	pthread_exit(NULL);
+}
+
+int triangle(int n)
+{
+	return (n * (n + 1)) / 2;
 }
 
 void cholesky(MatrixXd& A, int p, int b)
@@ -49,16 +61,20 @@ void cholesky(MatrixXd& A, int p, int b)
 			A.block(i * b, k * b, b, b) = A.block(k * b, k * b, b, b).transpose().triangularView<Upper>().solve<OnTheRight>(A.block(i * b, k * b, b, b));
 			// A.block(i * b, k * b, b, b) = A.block(i * b, k * b, b, b) * A.block(k * b, k * b, b, b).transpose().inverse();
 		}
+		int size = triangle(p - k - 1);
 		vector<pthread_t> threads;
-		// threads.reserve(p * p);
-		vector<bool*> completes;
-		// completes.reserve(p * p);
+		threads.reserve(size);
+		vector<flags> completes;
+		completes.reserve(size);
+		vector<gemm_args> argss;
+		argss.reserve(size);
 		for (int i = k + 1; i < p; i++)
 		{
 			for (int j = k + 1; j <= i; j++)
 			{
 				// cout << "i=" << i << ", j=" << j << endl;
-				bool *f = new bool(false);
+				flags f;
+				f.complete = false;
 				// cout << "bool *f = new bool(false);" << endl;
 				completes.push_back(f);
 				// cout << "completes.push_back(f);" << endl;
@@ -75,38 +91,51 @@ void cholesky(MatrixXd& A, int p, int b)
 				args.j = j;
 				args.k = k;
 				args.b = b;
-				args.complete = completes[i];
+				// cout << "i=" << i << ", j=" << j << ": index " << &completes[completes.size() - 1] << ", thread " << &threads[threads.size() - 1] << ", args " << &args << endl;
+				args.f = &completes[completes.size() - 1];
+				argss.push_back(args);
 				// cout << "creating thread" << endl;
-				pthread_create(&threads[i], NULL, gemm, (void*) &args);
+				pthread_create(&threads[threads.size() - 1], NULL, gemm, (void*) &argss[argss.size() - 1]);
+				// pthread_join(threads[l], NULL);
+				// this_thread::sleep_for(chrono::seconds(50));
 				// cout << "I am done creating the thread " << i << " " << j << " " << k << " " << p << endl;
 			}
 		}
+		/*
+		cout << "threads: " << endl;
+		for (int i = 0; i < size; i++)
+		{
+			cout << &threads[i] << endl;
+		}
+		cout << "completes" << endl;
+		for (int i = 0; i < size; i++)
+		{
+			cout << &completes[i] << endl;
+		}
+		*/
 		// cout << "out of the loop " << k << endl;
 		int start = 0; // to ensure that it's not checking the same thing twice
 		while (true)
 		{
-			bool shouldBreak = true;
 			/*
-			for (int i = k + 1; i < p; i++)
+			cout << completes.size() << ":" << endl;
+			for (int i = 0; i < completes.size(); i++)
 			{
-				for (int j = k + 1; j <= i; j++)
+				if (completes[i].complete)
 				{
-					if (!completes[i * p + j])
-					{
-						start = i;
-						shouldBreak = false;
-						break;
-					}
+					cout << "true ";
 				}
-				if (!shouldBreak)
+				else
 				{
-					break;
+					cout << "false ";
 				}
 			}
+			cout << endl;
 			*/
-			for (int i = start; i < threads.size(); i++)
+			bool shouldBreak = true;
+			for (int i = start; i < completes.size(); i++)
 			{
-				if (!(*completes[i]))
+				if (!completes[i].complete)
 				{
 					start = i;
 					shouldBreak = false;
