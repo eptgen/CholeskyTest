@@ -12,6 +12,30 @@
 using namespace std;
 using namespace Eigen;
 
+void choleskyOneThread(MatrixXd& A, int p, int b)
+{
+	// p * b = size of A
+	for (int k = 0; k < p; k++)
+	{
+		// A.block(k * b, k * b, b, b) = A.block(k * b, k * b, b, b).llt().matrixL();
+		Ref<MatrixXd> Akk = A.block(k * b, k * b, b, b);
+		LLT<Ref<MatrixXd>> llt(Akk);
+		for (int i = k + 1; i < p; i++)
+		{
+			A.block(i * b, k * b, b, b) = A.block(k * b, k * b, b, b).transpose().triangularView<Upper>().solve<OnTheRight>(A.block(i * b, k * b, b, b));
+			// A.block(i * b, k * b, b, b) = A.block(i * b, k * b, b, b) * A.block(k * b, k * b, b, b).transpose().inverse();
+		}
+		for (int i = k + 1; i < p; i++)
+		{
+			for (int j = k + 1; j <= i; j++)
+			{
+				A.block(i * b, j * b, b, b) -= A.block(i * b, k * b, b, b) * A.block(j * b, k * b, b, b).transpose();
+			}
+		}
+	}
+	A = A.triangularView<Lower>();
+}
+
 struct flags
 {
 	bool complete;
@@ -21,23 +45,26 @@ struct gemm_args
 {
 	MatrixXd* A;
 	int i;
-	int j;
+	int p;
 	int k;
 	int b;
 	flags* f;
 };
 
-void *gemm(void *arguments)
+void *manyGemms(void *arguments)
 {
 	gemm_args *args = (gemm_args*) arguments;
 	MatrixXd *A = (MatrixXd*) args->A;
 	int i = args->i;
-	int j = args->j;
+	int p = args->p;
 	int k = args->k;
 	int b = args->b;
-	// cout << "A" << i << j << " -= A" << i << k << " * A" << j << k << "^T" << endl;
-	A->block(i * b, j * b, b, b) -= A->block(i * b, k * b, b, b) * A->block(j * b, k * b, b, b).transpose();
-	// cout << "i=" << i << ", j=" << j << ": setting " << args->f << " from " << args->f->complete << " to 1" << endl;
+	for (int j = k + 1; j <= i; j++)
+	{
+		// cout << "A" << i << j << " -= A" << i << k << " * A" << j << k << "^T" << endl;
+		A->block(i * b, j * b, b, b) -= A->block(i * b, k * b, b, b) * A->block(j * b, k * b, b, b).transpose();
+		// cout << "i=" << i << ", j=" << j << ": setting " << args->f << " from " << args->f->complete << " to 1" << endl;
+	}
 	args->f->complete = true;
 	// cout << "done setting complete to " << args->f->complete << endl;
 	pthread_exit(NULL);
@@ -61,45 +88,29 @@ void cholesky(MatrixXd& A, int p, int b)
 			A.block(i * b, k * b, b, b) = A.block(k * b, k * b, b, b).transpose().triangularView<Upper>().solve<OnTheRight>(A.block(i * b, k * b, b, b));
 			// A.block(i * b, k * b, b, b) = A.block(i * b, k * b, b, b) * A.block(k * b, k * b, b, b).transpose().inverse();
 		}
-		int size = triangle(p - k - 1);
+		int size = p - k - 1;
 		vector<pthread_t> threads;
 		threads.reserve(size);
 		vector<flags> completes;
 		completes.reserve(size);
 		vector<gemm_args> argss;
 		argss.reserve(size);
-		for (int i = k + 1; i < p; i++)
+		for (int i = p - 1; i > k; i--)
 		{
-			for (int j = k + 1; j <= i; j++)
-			{
-				// cout << "i=" << i << ", j=" << j << endl;
-				flags f;
-				f.complete = false;
-				// cout << "bool *f = new bool(false);" << endl;
-				completes.push_back(f);
-				// cout << "completes.push_back(f);" << endl;
-				pthread_t thread;
-				// cout << "pthread_t thread;" << endl;
-				// cout << "threads.size() == " << threads.size() << endl;
-				threads.push_back(thread);
-				// cout << "threads.push_back(thread);" << endl;
-				gemm_args args;
-				// cout << "gemm_args args;" << endl;
-				args.A = &A;
-				// cout << "args.A = &A;" << endl;
-				args.i = i;
-				args.j = j;
-				args.k = k;
-				args.b = b;
-				// cout << "i=" << i << ", j=" << j << ": index " << &completes[completes.size() - 1] << ", thread " << &threads[threads.size() - 1] << ", args " << &args << endl;
-				args.f = &completes[completes.size() - 1];
-				argss.push_back(args);
-				// cout << "creating thread" << endl;
-				pthread_create(&threads[threads.size() - 1], NULL, gemm, (void*) &argss[argss.size() - 1]);
-				// pthread_join(threads[l], NULL);
-				// this_thread::sleep_for(chrono::seconds(50));
-				// cout << "I am done creating the thread " << i << " " << j << " " << k << " " << p << endl;
-			}
+			flags f;
+			f.complete = false;
+			completes.push_back(f);
+			pthread_t thread;
+			threads.push_back(thread);
+			gemm_args args;
+			args.A = &A;
+			args.i = i;
+			args.k = k;
+			args.b = b;
+			args.f = &completes[completes.size() - 1];
+			args.p = p;
+			argss.push_back(args);
+			pthread_create(&threads[threads.size() - 1], NULL, manyGemms, (void*) &argss[argss.size() - 1]);
 		}
 		/*
 		cout << "threads: " << endl;
@@ -114,8 +125,12 @@ void cholesky(MatrixXd& A, int p, int b)
 		}
 		*/
 		// cout << "out of the loop " << k << endl;
-		int start = 0; // to ensure that it's not checking the same thing twice
-		while (true)
+		int i = 0; // to ensure that it's not checking the same thing twice
+		// cout << "====================" << endl;
+		// cout << completes.size() << endl;
+		// cout << size << endl;
+		// cout << "====================" << endl;
+		while (true && size > 0)
 		{
 			/*
 			cout << completes.size() << ":" << endl;
@@ -132,6 +147,7 @@ void cholesky(MatrixXd& A, int p, int b)
 			}
 			cout << endl;
 			*/
+			/*
 			bool shouldBreak = true;
 			for (int i = start; i < completes.size(); i++)
 			{
@@ -146,6 +162,17 @@ void cholesky(MatrixXd& A, int p, int b)
 			{
 				break;
 			}
+			*/
+			// cout << i << endl;
+			if (completes[i].complete)
+			{
+				i++;
+				if (i == size)
+				{
+					break;
+				}
+			}
+			
 		}
 	}
 	A = A.triangularView<Lower>();
