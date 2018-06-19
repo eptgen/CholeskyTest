@@ -27,7 +27,6 @@ bool test()
 	bool result = true;
 	for (int i = 1; i <= NUM_TESTS; i++)
 	{
-		cout << "Test " << i << ": ";
 		
 		string fileName = "tests/";
 		fileName.append(to_string(i));
@@ -37,6 +36,8 @@ bool test()
 		int blockSize;
 		int numBlocks;
 		current >> size >> blockSize >> numBlocks;
+		cout << "Test " << i << " (" << size << "x" << size << " matrix, " << blockSize << "x" << blockSize << " blocks)" << ": ";
+		
 		MatrixXd test(size, size);
 		for (int j = 0; j < size; j++)
 		{
