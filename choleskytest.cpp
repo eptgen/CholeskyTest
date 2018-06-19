@@ -236,7 +236,7 @@ void cholesky(MatrixXd& A, int p, int b)
 		// cout << completes.size() << endl;
 		// cout << size << endl;
 		// cout << "====================" << endl;
-		while (true && NUM_THREADS > 0)
+		while (true)
 		{
 			/*
 			cout << completes.size() << ":" << endl;
