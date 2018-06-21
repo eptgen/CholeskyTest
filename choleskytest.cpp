@@ -7,6 +7,7 @@
 #include <thread>
 #include <chrono>
 #include <sys/time.h>
+#include <unistd.h>
 #include "unittests.h"
 #include "choleskytest.h"
 
@@ -39,18 +40,12 @@ void choleskyOneThread(MatrixXd& A, int p, int b)
 	A = A.triangularView<Lower>();
 }
 
-struct flags
-{
-	bool complete;
-};
-
 struct gemm_args
 {
 	MatrixXd* A;
 	int p;
 	int k;
 	int b;
-	flags* f;
 	int startI; // inclusive
 	int startJ; // inclusive
 	int endI; // inclusive
@@ -106,7 +101,6 @@ void *manyGemms(void *arguments)
 			A->block(i * b, j * b, b, b) -= A->block(i * b, k * b, b, b) * A->block(j * b, k * b, b, b).transpose();
 		}
 	}
-	args->f->complete = true;
 	pthread_exit(NULL);
 }
 
@@ -115,15 +109,14 @@ int triangle(int n)
 	return (n * (n + 1)) / 2;
 }
 
-pthread_t threads[NUM_THREADS];
-flags completes[NUM_THREADS];
-gemm_args argss[NUM_THREADS];
-int endI[NUM_THREADS];
-int endJ[NUM_THREADS];
 void cholesky(MatrixXd& A, int p, int b)
 {
 	// p * b = size of A
 	double ttime = 0;
+	pthread_t threads[NUM_THREADS];
+	gemm_args argss[NUM_THREADS];
+	int endI[NUM_THREADS];
+	int endJ[NUM_THREADS];
 	for (int k = 0; k < p; k++)
 	{
 		// cout << "======== k=" << k << " ========" << endl;
@@ -174,15 +167,11 @@ void cholesky(MatrixXd& A, int p, int b)
 		}
 		for (int i = 0; i < NUM_THREADS; i++)
 		{
-			flags f;
-			f.complete = false;
-			completes[i] = f;
 			gemm_args args;
 			args.A = &A;
 			args.k = k;
 			args.b = b;
 			args.p = p;
-			args.f = &completes[i];
 			if (i == 0)
 			{
 				args.startI = k + 1;
@@ -231,69 +220,32 @@ void cholesky(MatrixXd& A, int p, int b)
 		}
 		*/
 		// cout << "out of the loop " << k << endl;
-		int i = 0; // to ensure that it's not checking the same thing twice
-		// cout << "====================" << endl;
-		// cout << completes.size() << endl;
-		// cout << size << endl;
-		// cout << "====================" << endl;
-		while (true)
+		
+		timeval start;
+		timeval end;
+		gettimeofday(&start, 0);
+		for (int i = 0; i < NUM_THREADS; i++)
 		{
-			/*
-			cout << completes.size() << ":" << endl;
-			for (int i = 0; i < completes.size(); i++)
-			{
-				if (completes[i].complete)
-				{
-					cout << "true ";
-				}
-				else
-				{
-					cout << "false ";
-				}
-			}
-			cout << endl;
-			*/
-			/*
-			bool shouldBreak = true;
-			for (int i = start; i < completes.size(); i++)
-			{
-				if (!completes[i].complete)
-				{
-					start = i;
-					shouldBreak = false;
-					break;
-				}
-			}
-			if (shouldBreak)
-			{
-				break;
-			}
-			*/
-			// cout << i << endl;
-			if (completes[i].complete)
-			{
-				i++;
-				if (i == NUM_THREADS)
-				{
-					break;
-				}
-			}
-			
+			pthread_join(threads[i], NULL);
 		}
+		gettimeofday(&end, 0);
+		ttime += timeSubtract(end, start);
+		
 		// cout << "=====================" << endl;
 	}
 	A = A.triangularView<Lower>();
-	// cout << "Total time thread calls took: " << ttime << " s" << endl;
+	cout << "Total time thread calls took: " << ttime << " s" << endl;
 }
 
 int main()
 {
 	/*
+	
 	srand(time(NULL));
 	
-	int size = 4;
-	int p = 2;
-	int b = 2;
+	int size = 16;
+	int p = 16;
+	int b = 1;
 	// p * b == size
 	MatrixXd testMatrix(size, size);
 	
@@ -344,6 +296,7 @@ int main()
 	}
 	cout << "errors:" << endl;
 	cout << errors << endl;
+	
 	*/
 	
 	test();
