@@ -1,4 +1,5 @@
 #include <iostream>
+#include <string>
 #include <random>
 #include <time.h>
 #include <Eigen/Dense>
@@ -16,33 +17,43 @@ using namespace Eigen;
 
 const int NUM_THREADS = 2;
 
-void choleskyOneThread(MatrixXd& A, int p, int b)
+void choleskyOneThread(vector<vector<MatrixXd>>& A, int p, int b)
 {
 	// p * b = size of A
 	for (int k = 0; k < p; k++)
 	{
 		// A.block(k * b, k * b, b, b) = A.block(k * b, k * b, b, b).llt().matrixL();
-		Ref<MatrixXd> Akk = A.block(k * b, k * b, b, b);
+		Ref<MatrixXd> Akk = A[k][k];
 		LLT<Ref<MatrixXd>> llt(Akk);
 		for (int i = k + 1; i < p; i++)
 		{
-			A.block(i * b, k * b, b, b) = A.block(k * b, k * b, b, b).transpose().triangularView<Upper>().solve<OnTheRight>(A.block(i * b, k * b, b, b));
+			A[i][k] = A[k][k].transpose().triangularView<Upper>().solve<OnTheRight>(A[i][k]);
 			// A.block(i * b, k * b, b, b) = A.block(i * b, k * b, b, b) * A.block(k * b, k * b, b, b).transpose().inverse();
 		}
 		for (int i = k + 1; i < p; i++)
 		{
 			for (int j = k + 1; j <= i; j++)
 			{
-				A.block(i * b, j * b, b, b) -= A.block(i * b, k * b, b, b) * A.block(j * b, k * b, b, b).transpose();
+				A[i][j] -= A[i][k] * A[j][k].transpose();
 			}
 		}
 	}
-	A = A.triangularView<Lower>();
+	for (int i = 0; i < p; i++)
+	{
+		A[i][i] = A[i][i].triangularView<Lower>();
+	}
+	for (int i = 0; i < p; i++)
+	{
+		for (int j = i + 1; j < p; j++)
+		{
+			A[i][j] = MatrixXd::Zero(b, b);
+		}
+	}
 }
 
 struct gemm_args
 {
-	MatrixXd* A;
+	vector<vector<MatrixXd>>* A;
 	int p;
 	int k;
 	int b;
@@ -76,7 +87,7 @@ void *manyGemms(void *arguments)
 void *manyGemms(void *arguments)
 {
 	gemm_args *args = (gemm_args*) arguments;
-	MatrixXd *A = (MatrixXd*) args->A;
+	vector<vector<MatrixXd>> *A = (vector<vector<MatrixXd>>*) args->A;
 	int k = args->k;
 	int p = args->p;
 	int b = args->b;
@@ -98,7 +109,9 @@ void *manyGemms(void *arguments)
 		}
 		for (int j = currStartJ; j < currEndJ; j++)
 		{
-			A->block(i * b, j * b, b, b) -= A->block(i * b, k * b, b, b) * A->block(j * b, k * b, b, b).transpose();
+			// cout << "(" << i << ", " << j << "): before: " << endl << (*A)[i][j] << endl;
+			(*A)[i][j] -= (*A)[i][k] * (*A)[j][k].transpose();
+			// cout << "after: " << endl << (*A)[i][j] << endl;
 		}
 	}
 	pthread_exit(NULL);
@@ -109,7 +122,7 @@ int triangle(int n)
 	return (n * (n + 1)) / 2;
 }
 
-void cholesky(MatrixXd& A, int p, int b)
+void cholesky(vector<vector<MatrixXd>>& A, int p, int b)
 {
 	// p * b = size of A
 	double ttime = 0;
@@ -121,11 +134,10 @@ void cholesky(MatrixXd& A, int p, int b)
 	{
 		// cout << "======== k=" << k << " ========" << endl;
 		// A.block(k * b, k * b, b, b) = A.block(k * b, k * b, b, b).llt().matrixL();
-		Ref<MatrixXd> Akk = A.block(k * b, k * b, b, b);
-		LLT<Ref<MatrixXd>> llt(Akk);
+		LLT<Ref<MatrixXd>> llt(A[k][k]); // HMMMM
 		for (int i = k + 1; i < p; i++)
 		{
-			A.block(i * b, k * b, b, b) = A.block(k * b, k * b, b, b).transpose().triangularView<Upper>().solve<OnTheRight>(A.block(i * b, k * b, b, b));
+			A[i][k] = A[k][k].transpose().triangularView<Upper>().solve<OnTheRight>(A[i][k]);
 			// A.block(i * b, k * b, b, b) = A.block(i * b, k * b, b, b) * A.block(k * b, k * b, b, b).transpose().inverse();
 		}
 		/*
@@ -187,6 +199,7 @@ void cholesky(MatrixXd& A, int p, int b)
 			// cout << args.startI << "," << args.startJ << "-" << args.endI << "," << args.endJ << endl;
 			argss[i] = args;
 			pthread_create(&threads[i], NULL, manyGemms, (void*) &argss[i]);
+			// pthread_join(threads[i], NULL);
 		}
 		/*
 		for (int i = p - 1; i > k; i--)
@@ -233,70 +246,115 @@ void cholesky(MatrixXd& A, int p, int b)
 		
 		// cout << "=====================" << endl;
 	}
-	A = A.triangularView<Lower>();
-	cout << "Total time thread calls took: " << ttime << " s" << endl;
+	
+	for (int i = 0; i < p; i++)
+	{
+		A[i][i] = A[i][i].triangularView<Lower>();
+	}
+	for (int i = 0; i < p; i++)
+	{
+		for (int j = i + 1; j < p; j++)
+		{
+			A[i][j] = MatrixXd::Zero(b, b);
+		}
+	}
+	// cout << "Total time thread calls took: " << ttime << " s" << endl;
 }
 
 int main()
 {
-	/*
+	// cout << "PROGRAM: START" << endl;
 	
+	/*
 	srand(time(NULL));
 	
-	int size = 16;
-	int p = 16;
-	int b = 1;
+	int p = 4;
+	int b = 2;
 	// p * b == size
-	MatrixXd testMatrix(size, size);
+	MatrixXd conMatrix(p * b, p * b); // convenience matrix
+	vector<vector<MatrixXd>> testMatrix;
 	
-	for (int i = 0; i < size; i++)
+	// cout << "creating convenience matrix" << endl;
+	for (int i = 0; i < p * b; i++)
 	{
-		for (int j = 0; j < size; j++)
+		for (int j = 0; j < p * b; j++)
 		{
-			testMatrix(i, j) = rand() % 20 - 10;
+			conMatrix(i, j) = rand() % 20 - 10;
 		}
 	}
 	float smallNumber = 0.0005;
 	
-	testMatrix = testMatrix * testMatrix.transpose() + smallNumber * MatrixXd::Identity(size, size);
+	conMatrix = conMatrix * conMatrix.transpose() + smallNumber * MatrixXd::Identity(p * b, p * b);
 	
-	MatrixXd copyTestMatrix(testMatrix);
+	// cout << "creating testMatrix" << endl;
+	for (int i = 0; i < p; i++)
+	{
+		vector<MatrixXd> v;
+		testMatrix.push_back(v);
+		for (int j = 0; j < p; j++)
+		{
+			MatrixXd m(b, b);
+			testMatrix[i].push_back(m);
+			for (int k = 0; k < b; k++)
+			{
+				for (int l = 0; l < b; l++)
+				{
+					testMatrix[i][j](k, l) = conMatrix(i * b + k, j * b + l);
+				}
+			}
+		}
+	}
 	
 	cout << "This is A: " << endl;
-	cout << testMatrix << endl << endl;
+	cout << conMatrix << endl << endl;
 	
-	SelfAdjointEigenSolver<MatrixXd> eigensolver(testMatrix);
+	SelfAdjointEigenSolver<MatrixXd> eigensolver(conMatrix);
 	cout << "Eigenvalues: " << endl;
 	cout << eigensolver.eigenvalues() << endl << endl;
 	
-	MatrixXd answer = testMatrix.llt().matrixL();
+	MatrixXd answer = conMatrix.llt().matrixL();
 	cout << "Real Answer: " << endl;
 	cout << answer << endl << endl;
 	
 	cholesky(testMatrix, p, b);
 	
+	MatrixXd otherConMatrix(p * b, p * b);
+	for (int i = 0; i < p; i++)
+	{
+		for (int j = 0; j < p; j++)
+		{
+			for (int k = 0; k < b; k++)
+			{
+				for (int l = 0; l < b; l++)
+				{
+					otherConMatrix(i * b + k, j * b + l) = testMatrix[i][j](k, l);
+				}
+			}
+		}
+	}
+	
 	cout << "Test Answer: " << endl;
-	cout << testMatrix << endl << endl;
+	cout << otherConMatrix << endl << endl;
 	
 	cout << "This should be A (real answer): " << endl;
 	cout << answer * answer.transpose() << endl << endl;
 	
-	MatrixXd result = testMatrix * testMatrix.transpose();
+	
+	MatrixXd result = otherConMatrix * otherConMatrix.transpose();
 	cout << "This should ALSO be A (test answer): " << endl;
-	cout << testMatrix * testMatrix.transpose() << endl << endl;
+	cout << result << endl << endl;
 	
-	MatrixXd errors(size, size);
+	MatrixXd errors(p * b, p * b);
 	
-	for (int i = 0; i < size; i++)
+	for (int i = 0; i < p * b; i++)
 	{
-		for (int j = 0; j < size; j++)
+		for (int j = 0; j < p * b; j++)
 		{
-			errors(i, j) = copyTestMatrix(i, j) - result(i, j);
+			errors(i, j) = conMatrix(i, j) - result(i, j);
 		}
 	}
 	cout << "errors:" << endl;
 	cout << errors << endl;
-	
 	*/
 	
 	test();

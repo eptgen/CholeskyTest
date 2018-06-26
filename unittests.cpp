@@ -38,24 +38,63 @@ bool test()
 		current >> size >> blockSize >> numBlocks;
 		cout << "Test " << i << " (" << size << "x" << size << " matrix, " << blockSize << "x" << blockSize << " blocks)" << ": ";
 		
-		MatrixXd test(size, size);
+		vector<vector<MatrixXd>> test;
+		MatrixXd testCopy(size, size);
 		for (int j = 0; j < size; j++)
 		{
+			if (j % blockSize == 0)
+			{
+				vector<MatrixXd> v;
+				test.push_back(v);
+			}
 			for (int k = 0; k < size; k++)
 			{
-				current >> test(j, k);
+				if (k % blockSize == 0 && j % blockSize == 0)
+				{
+					// cout << "start" << endl;
+					MatrixXd m(blockSize, blockSize);
+					test[j / blockSize].push_back(m);
+					// cout << "end" << endl;
+				}
+				int a = j / blockSize;
+				int b = k / blockSize;
+				int c = j % blockSize;
+				int d = k % blockSize;
+				// cout << "(" << a << ", " << b << ", " << c << ", " << d << ")" << endl;
+				current >> test[a][b](c, d);
+				testCopy(j, k) = test[a][b](c, d);
 			}
 		}
-		MatrixXd testCopy(test);
+		
 		timeval start;
 		gettimeofday(&start, 0);
 		cholesky(test, numBlocks, blockSize);
 		timeval end;
 		gettimeofday(&end, 0);
 		double secElapsed = timeSubtract(end, start);
-		MatrixXd comp = test * test.transpose();
 		
-		// check for error < 1e-8
+		MatrixXd conMatrix(size, size);
+		for (int j = 0; j < numBlocks; j++)
+		{
+			for (int k = 0; k < numBlocks; k++)
+			{
+				for (int l = 0; l < blockSize; l++)
+				{
+					for (int m = 0; m < blockSize; m++)
+					{
+						conMatrix(j * blockSize + l, k * blockSize + m) = test[j][k](l, m);
+					}
+				}
+			}
+		}
+		MatrixXd comp = conMatrix * conMatrix.transpose();
+		/*
+		cout << endl;
+		cout << comp << endl;
+		cout << testCopy << endl;
+		*/
+		
+		// check for error < 1e-10
 		bool shouldBreak = false;
 		bool resultForCase = true;
 		double error = 0;
