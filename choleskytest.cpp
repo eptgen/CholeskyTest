@@ -4,7 +4,6 @@
 #include <time.h>
 #include <Eigen/Dense>
 #include <vector>
-#include <pthread.h>
 #include <thread>
 #include <chrono>
 #include <sys/time.h>
@@ -84,17 +83,16 @@ void *manyGemms(void *arguments)
 }
 */
 
-void *manyGemms(void *arguments)
+void manyGemms(gemm_args args)
 {
-	gemm_args *args = (gemm_args*) arguments;
-	vector<vector<MatrixXd>> *A = (vector<vector<MatrixXd>>*) args->A;
-	int k = args->k;
-	int p = args->p;
-	int b = args->b;
-	int startI = args->startI;
-	int startJ = args->startJ;
-	int endI = args->endI;
-	int endJ = args->endJ;
+	vector<vector<MatrixXd>> *A = (vector<vector<MatrixXd>>*) args.A;
+	int k = args.k;
+	int p = args.p;
+	int b = args.b;
+	int startI = args.startI;
+	int startJ = args.startJ;
+	int endI = args.endI;
+	int endJ = args.endJ;
 	for (int i = startI; i <= endI; i++)
 	{
 		int currStartJ = k + 1;
@@ -114,7 +112,6 @@ void *manyGemms(void *arguments)
 			// cout << "after: " << endl << (*A)[i][j] << endl;
 		}
 	}
-	pthread_exit(NULL);
 }
 
 int triangle(int n)
@@ -126,7 +123,7 @@ void cholesky(vector<vector<MatrixXd>>& A, int p, int b)
 {
 	// p * b = size of A
 	double ttime = 0;
-	pthread_t threads[NUM_THREADS];
+	thread* threads[NUM_THREADS];
 	gemm_args argss[NUM_THREADS];
 	int endI[NUM_THREADS];
 	int endJ[NUM_THREADS];
@@ -198,7 +195,9 @@ void cholesky(vector<vector<MatrixXd>>& A, int p, int b)
 			args.endJ = endJ[i];
 			// cout << args.startI << "," << args.startJ << "-" << args.endI << "," << args.endJ << endl;
 			argss[i] = args;
-			pthread_create(&threads[i], NULL, manyGemms, (void*) &argss[i]);
+			thread* t = new thread(manyGemms, args);
+			threads[i] = t;
+			// pthread_create(&threads[i], NULL, manyGemms, (void*) &argss[i]);
 			// pthread_join(threads[i], NULL);
 		}
 		/*
@@ -239,7 +238,7 @@ void cholesky(vector<vector<MatrixXd>>& A, int p, int b)
 		gettimeofday(&start, 0);
 		for (int i = 0; i < NUM_THREADS; i++)
 		{
-			pthread_join(threads[i], NULL);
+			threads[i]->join();
 		}
 		gettimeofday(&end, 0);
 		ttime += timeSubtract(end, start);
