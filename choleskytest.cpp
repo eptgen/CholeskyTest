@@ -8,6 +8,7 @@
 #include <chrono>
 #include <sys/time.h>
 #include <unistd.h>
+#include <map>
 #include "unittests.h"
 #include "choleskytest.h"
 
@@ -15,6 +16,11 @@ using namespace std;
 using namespace Eigen;
 
 const int NUM_THREADS = 2;
+
+const int LLT = 0;
+const int GEMM = 1;
+const int TRSM = 2;
+const int FINISH = 3;
 
 void choleskyOneThread(vector<vector<MatrixXd>>& A, int p, int b)
 {
@@ -50,214 +56,37 @@ void choleskyOneThread(vector<vector<MatrixXd>>& A, int p, int b)
 	}
 }
 
-struct gemm_args
+struct Op
 {
-	vector<vector<MatrixXd>>* A;
-	int p;
-	int k;
-	int b;
-	int startI; // inclusive
-	int startJ; // inclusive
-	int endI; // inclusive
-	int endJ; // not inclusive
-};
-
-/*
-void *manyGemms(void *arguments)
-{
-	gemm_args *args = (gemm_args*) arguments;
-	MatrixXd *A = (MatrixXd*) args->A;
-	int i = args->i;
-	int p = args->p;
-	int k = args->k;
-	int b = args->b;
-	for (int j = k + 1; j <= i; j++)
+	int id;
+	int i; // only when id != 3
+	int j; // only when id != 3
+	vector<Op> dependencies;
+	bool operator<(const Op& other)
 	{
-		// cout << "A" << i << j << " -= A" << i << k << " * A" << j << k << "^T" << endl;
-		A->block(i * b, j * b, b, b) -= A->block(i * b, k * b, b, b) * A->block(j * b, k * b, b, b).transpose();
-		// cout << "i=" << i << ", j=" << j << ": setting " << args->f << " from " << args->f->complete << " to 1" << endl;
-	}
-	args->f->complete = true;
-	// cout << "done setting complete to " << args->f->complete << endl;
-	pthread_exit(NULL);
-}
-*/
-
-void manyGemms(gemm_args args)
-{
-	vector<vector<MatrixXd>> *A = (vector<vector<MatrixXd>>*) args.A;
-	int k = args.k;
-	int p = args.p;
-	int b = args.b;
-	int startI = args.startI;
-	int startJ = args.startJ;
-	int endI = args.endI;
-	int endJ = args.endJ;
-	for (int i = startI; i <= endI; i++)
-	{
-		int currStartJ = k + 1;
-		int currEndJ = i + 1;
-		if (i == startI)
-		{
-			currStartJ = startJ;
-		}
-		if (i == endI)
-		{
-			currEndJ = endJ;
-		}
-		for (int j = currStartJ; j < currEndJ; j++)
-		{
-			// cout << "(" << i << ", " << j << "): before: " << endl << (*A)[i][j] << endl;
-			(*A)[i][j] -= (*A)[i][k] * (*A)[j][k].transpose();
-			// cout << "after: " << endl << (*A)[i][j] << endl;
-		}
+		return id < other.id || (id == other.id && i < other.i) || (id == other.id && i == other.i && j < other.j);
 	}
 }
 
-int triangle(int n)
+void goThroughTasks(vector<Op>* tasks)
 {
-	return (n * (n + 1)) / 2;
+	
 }
 
 void cholesky(vector<vector<MatrixXd>>& A, int p, int b)
 {
-	// p * b = size of A
-	double ttime = 0;
+	set<long long> completed
+	vector<Op> operationsToDo;
 	thread* threads[NUM_THREADS];
-	gemm_args argss[NUM_THREADS];
-	int endI[NUM_THREADS];
-	int endJ[NUM_THREADS];
-	for (int k = 0; k < p; k++)
-	{
-		// cout << "======== k=" << k << " ========" << endl;
-		// A.block(k * b, k * b, b, b) = A.block(k * b, k * b, b, b).llt().matrixL();
-		LLT<Ref<MatrixXd>> llt(A[k][k]); // HMMMM
-		for (int i = k + 1; i < p; i++)
-		{
-			A[i][k] = A[k][k].transpose().triangularView<Upper>().solve<OnTheRight>(A[i][k]);
-			// A.block(i * b, k * b, b, b) = A.block(i * b, k * b, b, b) * A.block(k * b, k * b, b, b).transpose().inverse();
-		}
-		/*
-		int size = p - k - 1;
-		vector<pthread_t> threads;
-		threads.reserve(size);
-		vector<flags> completes;
-		completes.reserve(size);
-		vector<gemm_args> argss;
-		argss.reserve(size);
-		*/
-		int numGemms = triangle(p - k - 1);
-		int gemmsPerThread = numGemms / NUM_THREADS;
-		int howManyOneExtra = numGemms % NUM_THREADS;
-		int ind = 0;
-		int current = 0;
-		for (int i = k + 1; i < p; i++)
-		{
-			int tgpt = gemmsPerThread; // tentativeGemmsPerThread
-			if (ind < howManyOneExtra)
-			{
-				tgpt++;
-			}
-			current += i - k;
-			if (current >= tgpt)
-			{
-				while (current >= tgpt && ind < NUM_THREADS)
-				{
-					endI[ind] = i;
-					endJ[ind] = (k + 1) + (i - k) - (current - tgpt);
-					current -= tgpt;
-					ind++;
-					if (ind >= howManyOneExtra)
-					{
-						tgpt = gemmsPerThread;
-					}
-				}
-			}
-		}
-		for (int i = 0; i < NUM_THREADS; i++)
-		{
-			gemm_args args;
-			args.A = &A;
-			args.k = k;
-			args.b = b;
-			args.p = p;
-			if (i == 0)
-			{
-				args.startI = k + 1;
-				args.startJ = k + 1;
-			}
-			else
-			{
-				args.startI = endI[i - 1];
-				args.startJ = endJ[i - 1];
-			}
-			args.endI = endI[i];
-			args.endJ = endJ[i];
-			// cout << args.startI << "," << args.startJ << "-" << args.endI << "," << args.endJ << endl;
-			argss[i] = args;
-			thread* t = new thread(manyGemms, args);
-			threads[i] = t;
-			// pthread_create(&threads[i], NULL, manyGemms, (void*) &argss[i]);
-			// pthread_join(threads[i], NULL);
-		}
-		/*
-		for (int i = p - 1; i > k; i--)
-		{
-			flags f;
-			f.complete = false;
-			completes.push_back(f);
-			pthread_t thread;
-			threads.push_back(thread);
-			gemm_args args;
-			args.A = &A;
-			args.i = i;
-			args.k = k;
-			args.b = b;
-			args.f = &completes[completes.size() - 1];
-			args.p = p;
-			argss.push_back(args);
-			pthread_create(&threads[threads.size() - 1], NULL, manyGemms, (void*) &argss[argss.size() - 1]);
-		}
-		*/
-		/*
-		cout << "threads: " << endl;
-		for (int i = 0; i < size; i++)
-		{
-			cout << &threads[i] << endl;
-		}
-		cout << "completes" << endl;
-		for (int i = 0; i < size; i++)
-		{
-			cout << &completes[i] << endl;
-		}
-		*/
-		// cout << "out of the loop " << k << endl;
-		
-		timeval start;
-		timeval end;
-		gettimeofday(&start, 0);
-		for (int i = 0; i < NUM_THREADS; i++)
-		{
-			threads[i]->join();
-		}
-		gettimeofday(&end, 0);
-		ttime += timeSubtract(end, start);
-		
-		// cout << "=====================" << endl;
-	}
-	
 	for (int i = 0; i < p; i++)
 	{
-		A[i][i] = A[i][i].triangularView<Lower>();
+		
 	}
-	for (int i = 0; i < p; i++)
+	for (int i = 0; i < NUM_THREADS; i++)
 	{
-		for (int j = i + 1; j < p; j++)
-		{
-			A[i][j] = MatrixXd::Zero(b, b);
-		}
+		thread* t = new thread(goThroughTasks, &operationsToDo);
+		threads[i] = t;
 	}
-	// cout << "Total time thread calls took: " << ttime << " s" << endl;
 }
 
 int main()
