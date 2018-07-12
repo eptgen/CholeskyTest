@@ -5,10 +5,14 @@
 #include <Eigen/Dense>
 #include <vector>
 #include <thread>
+#include <queue>
 #include <chrono>
 #include <sys/time.h>
 #include <unistd.h>
+#include <tuple>
 #include <map>
+#include <mutex>
+#include <set>
 #include "unittests.h"
 #include "choleskytest.h"
 
@@ -17,7 +21,7 @@ using namespace Eigen;
 
 const int NUM_THREADS = 2;
 
-const int LLT = 0;
+const int POTF = 0;
 const int GEMM = 1;
 const int TRSM = 2;
 const int FINISH = 3;
@@ -59,33 +63,253 @@ void choleskyOneThread(vector<vector<MatrixXd>>& A, int p, int b)
 struct Op
 {
 	int id;
-	int i; // only when id != 3
-	int j; // only when id != 3
-	vector<Op> dependencies;
-	bool operator<(const Op& other)
+	int i;
+	int j;
+	int k;
+	int cReq;
+	vector<tuple<int, int, int, int>> connect;
+	bool finConnect;
+};
+
+struct OpArgs
+{
+	queue<Op>* waitingOps;
+	mutex* waitingMutex;
+	queue<Op>* myOps;
+	mutex* myMutex;
+	vector<vector<MatrixXd>>* A;
+	int p;
+	map<tuple<int, int, int, int>, int>* ops;
+	set<tuple<int, int, int, int>>* alreadyPut;
+	mutex* countMutex;
+	mutex* setMutex;
+};
+
+void getPOTF(Op& o, int p)
+{
+	// o.id, o.i, o.j, and o.k should be filled out already
+	
+	if (o.k == 0)
 	{
-		return id < other.id || (id == other.id && i < other.i) || (id == other.id && i == other.i && j < other.j);
+		o.cReq = 0;
+	}
+	else
+	{
+		o.cReq = 1;
+	}
+	
+	for (int i = o.k + 1; i < p; i++)
+	{
+		tuple<int, int, int, int> t = make_tuple(TRSM, i, 0, o.k);
+		o.connect.push_back(t);
+	}
+	o.finConnect = o.k == p - 1;
+}
+
+void getTRSM(Op& o, int p)
+{
+	// o.id, o.i, o.j, and o.k should be filled out already
+	
+	if (o.k == 0)
+	{
+		o.cReq = 1;
+	}
+	else
+	{
+		o.cReq = 2;
+	}
+	
+	for (int i = o.k + 1; i < p; i++)
+	{
+		tuple<int, int, int, int> t = make_tuple(GEMM, i, o.i, o.k);
+		o.connect.push_back(t);
+	}
+	o.finConnect = false;
+}
+
+void getGEMM(Op& o, int p)
+{
+	// o.id, o.i, o.j, and o.k should be filled out already
+	
+	o.cReq = 1;
+	if (o.k > 0)
+	{
+		o.cReq++;
+	}
+	if (o.i != o.j)
+	{
+		o.cReq++;
+	}
+	
+	if (o.i == o.j && o.j == o.k + 1)
+	{
+		tuple<int, int, int, int> t = make_tuple(POTF, 0, 0, o.k + 1);
+		o.connect.push_back(t);
+	}
+	else if (o.j == o.k + 1)
+	{
+		tuple<int, int, int, int> t = make_tuple(TRSM, o.i, 0, o.k + 1);
+		o.connect.push_back(t);
+	}
+	else
+	{
+		tuple<int, int, int, int> t = make_tuple(GEMM, o.i, o.j, o.k + 1);
+		o.connect.push_back(t);
 	}
 }
 
-void goThroughTasks(vector<Op>* tasks)
+void getFINISH(Op& o, int p)
 {
-	
+	o.cReq = 1;
+	o.finConnect = false;
+}
+
+Op getOp(tuple<int, int, int, int> t, int p)
+{
+	Op result;
+	result.id = get<0>(t);
+	result.i = get<1>(t);
+	result.j = get<2>(t);
+	result.k = get<3>(t);
+	if (result.id == POTF)
+	{
+		getPOTF(result, p);
+	}
+	else if (result.id == TRSM)
+	{
+		getTRSM(result, p);
+	}
+	else if (result.id == GEMM)
+	{
+		getGEMM(result, p);
+	}
+	else if (result.id == FINISH)
+	{
+		getFINISH(result, p);
+	}
+	return result;
+}
+
+void operationDoer(OpArgs args)
+{
+	vector<vector<MatrixXd>>* A = args.A;
+	queue<Op>* waitingOps = args.waitingOps;
+	mutex* waitingMutex = args.waitingMutex;
+	mutex* myMutex = args.myMutex;
+	queue<Op>* myOps = args.myOps;
+	int p = args.p;
+	map<tuple<int, int, int, int>, int>* ops = args.ops;
+	set<tuple<int, int, int, int>>* alreadyPut = args.alreadyPut;
+	mutex* setMutex = args.setMutex;
+	mutex* countMutex = args.countMutex;
+	while (true)
+	{
+		lock_guard<mutex> lock(*myMutex);
+		int size = myOps->size();
+		delete &lock;
+		if (size > 0)
+		{
+			lock_guard<mutex> lock2(*myMutex);
+			Op curr = myOps->front();
+			myOps->pop();
+			delete &lock2;
+			int i = curr.i;
+			int j = curr.j;
+			int k = curr.k;
+			if (curr.id == POTF)
+			{
+				LLT<Ref<MatrixXd>> llt((*A)[k][k]);
+			}
+			else if (curr.id == TRSM)
+			{
+				(*A)[i][k] = (*A)[k][k].transpose().triangularView<Upper>().solve<OnTheRight>((*A)[i][k]);
+			}
+			else if (curr.id == GEMM)
+			{
+				(*A)[i][j] -= (*A)[i][k] * (*A)[j][k].transpose();
+			}
+			for (int i = 0; i < curr.connect.size(); i++)
+			{
+				lock_guard<mutex> lock3(*setMutex);
+				bool putInAlready = alreadyPut->find(curr.connect[i]) != alreadyPut->end();
+				delete &lock3;
+				if (!putInAlready)
+				{
+					lock_guard<mutex> lock4(*waitingMutex);
+					waitingOps->push(getOp(curr.connect[i], p));
+					delete &lock4;
+					lock_guard<mutex> lock5(*setMutex);
+					alreadyPut->insert(curr.connect[i]);
+					delete &lock5;
+				}
+				lock_guard<mutex> lock6(*countMutex);
+				(*ops)[curr.connect[i]]++;
+				delete &lock6;
+			}
+		}
+	}
 }
 
 void cholesky(vector<vector<MatrixXd>>& A, int p, int b)
 {
-	set<long long> completed
-	vector<Op> operationsToDo;
-	thread* threads[NUM_THREADS];
-	for (int i = 0; i < p; i++)
+	map<tuple<int, int, int, int>, int> ops;
+	queue<Op> waitingOps;
+	queue<Op> readyOps[NUM_THREADS];
+	mutex readyMutexes[NUM_THREADS];
+	mutex waitingMutex;
+	thread threads[NUM_THREADS];
+	for (int i = 0; i < NUM_THREADS; i++)
 	{
-		
+		OpArgs args;
+		queue<Op> readyOp;
+		readyOps[i] = readyOp;
+		thread t(operationDoer, args);
+		threads[i] = t;
+		args.waitingOps = &waitingOps;
+		args.myOps = &readyOps[i];
+		args.waitingMutex = &waitingMutex;
+		args.myMutex = &readyMutexes[i];
+		args.A = &A;
+		args.p = p;
+	}
+	int ind = 0;
+	tuple<int, int, int, int> firstT(POTF, 0, 0, 0);
+	Op firstOp = getOp(firstT, p);
+	waitingOps.push(firstOp);
+	while (true)
+	{
+		lock_guard<mutex> lock(waitingMutex);
+		int size = waitingOps.size();
+		delete &lock;
+		if (size > 0)
+		{
+			lock_guard<mutex> lock2(waitingMutex);
+			Op curr = waitingOps.front();
+			waitingOps.pop();
+			delete &lock2;
+			tuple<int, int, int, int> tu = make_tuple(curr.id, curr.i, curr.j, curr.k);
+			if (curr.cReq == ops[tu])
+			{
+				if (curr.id == FINISH)
+				{
+					break;
+				}
+				lock_guard<mutex> lock3(readyOps[ind % NUM_THREADS]);
+				readyOps[ind % NUM_THREADS]->push(curr);
+				delete &lock3;
+				ind++;
+			}
+			else
+			{
+				lock_guard<mutex> lock4(waitingMutex);
+				waitingOps.push(curr);
+				delete &lock4;
+			}
+		}
 	}
 	for (int i = 0; i < NUM_THREADS; i++)
 	{
-		thread* t = new thread(goThroughTasks, &operationsToDo);
-		threads[i] = t;
+		~threads[i];
 	}
 }
 
@@ -93,7 +317,6 @@ int main()
 {
 	// cout << "PROGRAM: START" << endl;
 	
-	/*
 	srand(time(NULL));
 	
 	int p = 4;
@@ -183,9 +406,8 @@ int main()
 	}
 	cout << "errors:" << endl;
 	cout << errors << endl;
-	*/
 	
-	test();
+	// test();
 	
 	return 0;
 }
