@@ -826,10 +826,10 @@ void test()
 
         if (i%10 == 0) printf("i %d\n",i);
 
-        const int nb = 8; // number of blocks
-        const int b = 4; // size of blocks
+        const int nb = 16; // number of blocks
+        const int b = 32; // size of blocks
 
-        const int n_thread = 1; // Number of threads to use
+        const int n_thread = 4; // Number of threads to use
 
         const int n = b*nb; // matrix size
 
