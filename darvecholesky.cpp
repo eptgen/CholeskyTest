@@ -22,7 +22,6 @@
 #include <atomic>
 
 #include <chrono>
-#include <sys/time.h>
 
 #ifdef PROFILER
 #include <gperftools/profiler.h>
@@ -33,11 +32,6 @@ using namespace std::chrono;
 #include <Eigen/Dense>
 using Eigen::MatrixXd;
 using Eigen::VectorXd;
-using Eigen::LLT;
-using Eigen::Ref;
-using Eigen::Upper;
-using Eigen::OnTheRight;
-using Eigen::Lower;
 
 using std::min;
 using std::max;
@@ -46,7 +40,6 @@ using std::list;
 using std::vector;
 using std::unordered_map;
 using std::array;
-using std::to_string;
 
 using std::thread;
 using std::mutex;
@@ -54,11 +47,6 @@ using std::bind;
 using std::atomic_int;
 
 typedef std::function<void()> Base_task;
-
-const int POTF = 0;
-const int GEMM = 1;
-const int TRSM = 2;
-const int FINISH = 3;
 
 // Builds a logging message and outputs it in the destructor
 class LogMessage {
@@ -123,27 +111,35 @@ struct Fun_mv {
 };
 
 struct Task : public Base_task {
-    atomic_int wait_count; // Number of incoming edges/tasks
-
-    bool m_delete = false;
-    // whether the object should be deleted after running the function
-    // to completion.
+    int m_wait_count; // Number of incoming edges/tasks
 
     float priority = 0.0; // task priority
 
+    bool m_delete = true;
+    // whether the object should be deleted after running the function
+    // to completion.
+
+	mutex mtx;
+	
     Task() {}
 
-    Task(Base_task a_f, int a_wcount = 0, bool a_del = false, float a_priority = 0.0) :
-        Base_task(a_f), m_delete(a_del), priority(a_priority)
-    {
-        wait_count.store(a_wcount);
-    }
+    Task(Base_task a_f, int a_wcount = 0, float a_priority = 0.0, bool a_del = true) :
+        Base_task(a_f), m_wait_count(a_wcount), priority(a_priority), m_delete(a_del)
+    {}
 
     ~Task() {};
 
-    void operator=(Base_task a_tsk)
+    void init(Base_task a_f, int a_wcount = 0, float a_priority = 0.0, bool a_del = true)
     {
-        Base_task::operator=(a_tsk);
+        Base_task::operator=(a_f);
+        m_wait_count = a_wcount;
+        priority = a_priority;
+        m_delete = a_del;
+    }
+
+    void operator=(Base_task a_f)
+    {
+        Base_task::operator=(a_f);
     }
 };
 
@@ -332,50 +328,77 @@ inline void hash_combine(std::size_t& seed, int const& v)
 
 struct hash {
     size_t
-    operator()(array<int,4> const& key) const
+    operator()(array<int,3> const& key) const
     {
         size_t seed = 0;
         hash_combine(seed, key[0]);
         hash_combine(seed, key[1]);
         hash_combine(seed, key[2]);
-		hash_combine(seed, key[3]);
         return seed;
     }
 };
 
 }
 
-typedef array<int,4> int4;
+typedef array<int,3> int3;
 
-struct Task_graph {
+struct Task_flow {
+
+    typedef std::function<void(int3&,Task*)> Init_task;
+    typedef std::function<int(int3&)> Map_task;
+
     Thread_team * team = nullptr;
 
-    unordered_map< int4, Task*, hash_array::hash > graph;
+    struct Init {
+        // How to initialize a task
+        Init_task init;
+        // Mapping from task index to thread id
+        Map_task map;
+
+        Init& task_init(Init_task a_init)
+        {
+            init = a_init;
+            return *this;
+        }
+
+        Init& compute_on(Map_task a_map)
+        {
+            map = a_map;
+            return *this;
+        }
+    } m_task;
+
+    Task_flow& operator=(Init & a_setup)
+    {
+        m_task.init = a_setup.init;
+        m_task.map = a_setup.map;
+        return *this;
+    }
+
+    unordered_map< int3, Task*, hash_array::hash > task_map;
+
     mutex mtx_graph, mtx_quiescence;
-    atomic_int n_active_task;
     std::condition_variable cond_quiescence;
 
     bool quiescence = false;
-    // boolean: all tasks have been posted and quiescence has been reached
+    // true = all tasks have been posted and quiescence has been reached
 
-    virtual ~Task_graph() {};
+    int n_task_in_graph = 0;
 
-    // How to initialize a task
-    virtual void initialize_task(int4&,Task*) = 0;
+    Task_flow(Thread_team * a_team) : team(a_team) {}
 
-    // Mapping from int4 task index to thread id
-    virtual int task_map(int4&) = 0;
+    virtual ~Task_flow() {}
 
-    // Find a task in the graph and return pointer
-    Task * find_task(int4&);
+    // Find a task in the task_map and return pointer
+    Task * find_task(int3&);
 
     // spawn task with index
-    void async(int4);
+    void async(int3);
     // spawn with index and task
-    void async(int4, Task*);
+    void async(int3, Task*);
 
     // Decrement the dependency counter and spawn task if ready
-    void decrement_wait_count(int4, int4);
+    void decrement_wait_count(int3);
 
     // Returns when all tasks have been posted
     void wait()
@@ -385,131 +408,79 @@ struct Task_graph {
     }
 };
 
-Task * Task_graph::find_task(int4 & idx)
+Task_flow::Init task_flow_init()
+{
+    return Task_flow::Init();
+}
+
+Task * Task_flow::find_task(int3 & idx)
 {
     Task * t_ = nullptr;
 
-    std::lock_guard<std::mutex> lck(mtx_graph);
-    auto tsk = graph.find(idx);
+    std::unique_lock<std::mutex> lck(mtx_graph);
+
+    auto tsk = task_map.find(idx);
 
     // Task exists
-    if (tsk != graph.end()) {
+    if (tsk != task_map.end()) {
         t_ = tsk->second;
     }
     else {
         // Task does not exist; create it
         t_ = new Task;
-        graph[idx] = t_; // Insert in graph
-        initialize_task(idx,t_);
-        ++ n_active_task; // Increment counter
+        task_map[idx] = t_; // Insert in task_map
+
+        m_task.init(idx,t_); // Initialize
+
+        ++n_task_in_graph; // Increment counter
     }
+
+    lck.unlock();
 
     assert(t_ != nullptr);
 
     return t_;
 }
 
-void Task_graph::async(int4 idx, Task * a_tsk)
+void Task_flow::async(int3 idx, Task * a_tsk)
 {
-    LOG("spawn task " << idx[0] << " " << idx[1] << " " << idx[2] << " " << idx[3]);
-	std::string text = "async ";
-	text += to_string(idx[0]);
-	text += " ";
-	text += to_string(idx[1]);
-	text += " ";
-	text += to_string(idx[2]);
-	text += " ";
-	text += to_string(idx[3]);
-	// std::cout << text << std::endl;
+    team->spawn(/*task map*/ m_task.map(idx), a_tsk);
 
-    // Delete entry in graph
-    {
-        std::lock_guard<std::mutex> lck(mtx_graph);
-        if (graph.find(idx) == graph.end())
-		{
-			return;
-		}
-        graph.erase(idx);
-    }
+    // Delete entry in task_map
+    std::unique_lock<std::mutex> lck(mtx_graph);
 
-    team->spawn(task_map(idx), a_tsk);
+    assert(task_map.find(idx) != task_map.end());
+    task_map.erase(idx);
 
-    -- n_active_task; // Decrement counter
-
-    assert(n_active_task.load() >= 0);
+    -- n_task_in_graph; // Decrement counter
+    assert(n_task_in_graph >= 0);
 
     // Signal if quiescence has been reached
-    if (n_active_task.load() == 0) {
+    if (n_task_in_graph == 0) {
+        lck.unlock();
         std::unique_lock<std::mutex> lck(mtx_quiescence);
         quiescence = true;
         cond_quiescence.notify_one(); // Notify waiting thread
     }
 }
 
-void Task_graph::async(int4 idx)
+void Task_flow::async(int3 idx)
 {
     Task * t_ = find_task(idx);
     async(idx, t_);
 }
 
-void Task_graph::decrement_wait_count(int4 idx, int4 src)
+void Task_flow::decrement_wait_count(int3 idx)
 {
     Task * t_ = find_task(idx);
-	
-	int before = t_->wait_count;
-	
+
     // Decrement counter
-    --( t_->wait_count );
-	
-	int after = t_->wait_count;
-	
-	
-	std::string str = "decrementing ";
-	str += to_string(idx[0]);
-	str += " ";
-	str += to_string(idx[1]);
-	str += " ";
-	str += to_string(idx[2]);
-	str += " ";
-	str += to_string(idx[3]);
-	str += " from ";
-	str += to_string(before);
-	str += " to ";
-	str += to_string(after);
-	str += "\n";
-	str += "Source: ";
-	str += to_string(src[0]);
-	str += " ";
-	str += to_string(src[1]);
-	str += " ";
-	str += to_string(src[2]);
-	str += " ";
-	str += to_string(src[3]);
-	str += "\n";
-	// std::cout << str;
+    std::unique_lock<std::mutex> lck(t_->mtx);
+	--(t_->m_wait_count);
+	assert(t_->m_wait_count >= 0);
 
-    assert(t_->wait_count.load() >= 0);
-
-    if (t_->wait_count.load() == 0) { // task is ready to run
-		std::string text = "async ";
-		text += to_string(idx[0]);
-		text += " ";
-		text += to_string(idx[1]);
-		text += " ";
-		text += to_string(idx[2]);
-		text += " ";
-		text += to_string(idx[3]);
-		text += "\n";
-		text += "Source: ";
-		text += to_string(src[0]);
-		text += " ";
-		text += to_string(src[1]);
-		text += " ";
-		text += to_string(src[2]);
-		text += " ";
-		text += to_string(src[3]);
-		text += "\n";
-		// std::cout << text;
+    if (t_->m_wait_count == 0) { // task is ready to run
+		lck.unlock();
         async(idx, t_);
     }
 }
@@ -535,141 +506,6 @@ struct Block_matrix : vector<MatrixXd*> {
     }
 };
 
-struct Chol_graph: public Task_graph {
-	int size_id = -1;
-    int size_i = -1;
-    int size_j = -1;
-    int size_k = -1;
-    Block_matrix A;
-
-    void initialize_task(int4&, Task*);
-
-    int task_map(int4 & idx)
-    {
-        return ( ( idx[0] + size_i * idx[1] ) % ( team->v_thread.size() ) );
-    }
-
-    void start();
-};
-
-void fun_chol(Chol_graph * m_g, int id, int i, int j, int k)
-{
-	assert(id>=0 && id < m_g->size_id);
-    assert(i>=0 && i<m_g->size_i);
-    assert(j>=0 && j<m_g->size_j);
-    assert(k>=0 && k<m_g->size_k);
-    LOG(i << " " << j << " " << k);
-
-	if (id == POTF)
-	{
-		LLT<Ref<MatrixXd>> llt(*m_g->A(k, k));
-		for (int l = k + 1; l < m_g->size_i; l++)
-		{
-			m_g->decrement_wait_count({TRSM, l, 0, k}, {id, i, j, k});
-		}
-	}
-	else if (id == TRSM)
-	{
-		*m_g->A(i, k) = m_g->A(k, k)->transpose().triangularView<Upper>().solve<OnTheRight>(*m_g->A(i, k));
-		for (int l = k + 1; l < m_g->size_i; l++)
-		{
-			if (l >= i)
-			{
-				m_g->decrement_wait_count({GEMM, l, i, k}, {id, i, j, k});
-			}
-			else
-			{
-				m_g->decrement_wait_count({GEMM, i, l, k}, {id, i, j, k});
-			}
-		}
-	}
-	else if (id == GEMM)
-	{
-		*m_g->A(i, j) -= *m_g->A(i, k) * m_g->A(j, k)->transpose();
-		if (i == j && j == k + 1)
-		{
-			m_g->decrement_wait_count({POTF, 0, 0, k + 1}, {id, i, j, k});
-		}
-		else if (j == k + 1)
-		{
-			m_g->decrement_wait_count({TRSM, i, 0, k + 1}, {id, i, j, k});
-		}
-		else
-		{
-			m_g->decrement_wait_count({GEMM, i, j, k + 1}, {id, i, j, k});
-		}
-	}
-	// std::cout << id << " " << i << " " << j << " " << k << std::endl;
-}
-
-void Chol_graph::initialize_task(int4 & idx, Task* a_tsk)
-{
-    assert(a_tsk != nullptr);
-	int id = idx[0];
-	int i = idx[1];
-	int j = idx[2];
-	int k = idx[3];
-	
-	if (id == POTF)
-	{
-		if (k == 0)
-		{
-			a_tsk->wait_count.store(0);
-		}
-		else
-		{
-			a_tsk->wait_count.store(1);
-		}
-	}
-	else if (id == TRSM)
-	{
-		if (k == 0)
-		{
-			a_tsk->wait_count.store(1);
-		}
-		else
-		{
-			a_tsk->wait_count.store(2);
-		}
-	}
-	else if (id == GEMM)
-	{
-		int nReq = 1;
-		if (k > 0)
-		{
-			nReq++;
-		}
-		if (i != j)
-		{
-			nReq++;
-		}
-		/*
-		if (i == 2 && j == 1 && k == 0)
-		{
-			std::cout << "nReq: " << nReq << std::endl;
-		}
-		*/
-		a_tsk->wait_count.store(nReq);
-	}
-	
-    a_tsk->m_delete = true; // free memory after execution
-    (*a_tsk) = bind(fun_chol,this,idx[0],idx[1],idx[2], idx[3]);
-}
-
-void Chol_graph::start()
-{
-    assert(size_i>0);
-    assert(size_j>0);
-    assert(size_k>0);
-	assert(size_id>0);
-    assert(A.size() == static_cast<unsigned long>(size_i*size_k));
-    assert(team != nullptr);
-
-    n_active_task.store(0); // Active task counter
-
-    async({POTF, 0, 0, 0});
-}
-
 void test();
 
 int main(void)
@@ -685,22 +521,15 @@ int main(void)
     return 0;
 }
 
-double timeSubtract(timeval t1, timeval t2)
-{
-	long m1 = t1.tv_sec * 1000000 + t1.tv_usec;
-	long m2 = t2.tv_sec * 1000000 + t2.tv_usec;
-	return double(m1 - m2) / 1000000;
-}
-
 void test()
 {
 
     {
         Task t1( f_1 );
-        assert(t1.wait_count.load() == 0);
+        assert(t1.m_wait_count == 0);
 
         Task t2( f_2, 4 );
-        assert(t2.wait_count.load() == 4);
+        assert(t2.m_wait_count == 4);
 
         t1();
         t2();
@@ -756,12 +585,9 @@ void test()
 
         vector<Task> tsk(n_thread);
         for(int nt=0; nt<n_thread; ++nt) {
-            tsk[nt] = bind(f_count, &counter[nt]);
+            tsk[nt].init(bind(f_count, &counter[nt]), 0, 0., false);
         }
 
-#ifdef PROFILER
-        ProfilerStart("ctxx.pprof");
-#endif
         {
             team.start();
 #ifdef PROFILER
@@ -770,6 +596,7 @@ void test()
             for(int it=0; it < max_count; ++it) {
                 for(int nt=0; nt<n_thread; ++nt) {
                     team.spawn(0, &tsk[nt]);
+                    // spawn @ 0
                 }
             }
             team.join();
@@ -796,6 +623,7 @@ void test()
             for(int it=0; it < max_count; ++it) {
                 for(int nt=0; nt<n_thread; ++nt) {
                     team.spawn(nt, &tsk[nt]);
+                    // spawn @ nt
                 }
             }
             team.join();
@@ -806,36 +634,25 @@ void test()
 #endif
         }
 
-#ifdef PROFILER
-        ProfilerStop();
-#endif
-
         for(int nt=0; nt<n_thread; ++nt) {
             assert(counter[nt].load() == max_count);
         }
     }
 
-	// Initialize GEMM matrices
-	std::mt19937 mers_rand;
-	// Seed the engine
-	mers_rand.seed(2018);
-	
-	timeval start;
-	gettimeofday(&start, NULL);
-    for (int i=0; i<100; ++i) {
+    {
+        const int nb = 32; // number of blocks
+        const int b = 16;  // size of blocks
 
-        if (i%10 == 0) printf("i %d\n",i);
-
-        const int nb = 16; // number of blocks
-        const int b = 32; // size of blocks
-
-        const int n_thread = 4; // Number of threads to use
+        const int n_thread = 128; // number of threads to use
 
         const int n = b*nb; // matrix size
 
         MatrixXd A(n,n);
 
-        LOG("matrix");
+        // Initialize GEMM matrices
+        std::mt19937 mers_rand;
+        // Seed the engine
+        mers_rand.seed(2018);
 
         for (int i=0; i<n; ++i) {
             for (int j=0; j<n; ++j) {
@@ -844,79 +661,266 @@ void test()
         }
 		// std::cout << "A: " << std::endl << A << std::endl;
 		A = A * A.transpose() + MatrixXd::Identity(n, n) * 0.0005;
-		// std::cout << "A: " << std::endl << A << std::endl;
-
+		
         auto start = high_resolution_clock::now();
         MatrixXd L = A.llt().matrixL();
-        //printf("First entry in C: %g\n",C(0,0));
         auto end = high_resolution_clock::now();
         auto duration_ = duration_cast<milliseconds>(end - start);
+        std::cout << "llt elapsed: " << duration_.count() << "\n";
 
-        LOG("init");
-
-        Chol_graph chol_g;
-		chol_g.size_id = 4;
-        chol_g.size_i = nb;
-        chol_g.size_j = nb;
-        chol_g.size_k = nb;
-        chol_g.A.resize(nb,nb);
-
-        LOG("graph");
+        Block_matrix Ab(nb,nb);
 
         for (int i=0; i<nb; ++i) {
             for (int j=0; j <nb; ++j) {
-                chol_g.A(i,j) = new MatrixXd(A.block(i*b,j*b,b,b));
+                Ab(i,j) = new MatrixXd(A.block(i*b,j*b,b,b));
             }
         }
 
         for (int i=0; i<nb; ++i) {
             for (int j=0; j <nb; ++j) {
-                assert(*chol_g.A(i,j) == A.block(i*b,j*b,b,b));
+                assert(*(Ab(i,j)) == A.block(i*b,j*b,b,b));
             }
         }
+		
+		/*
+
+        start = high_resolution_clock::now();
+        // Calculate matrix product using blocks
+        for (int i=0; i<nb; ++i) {
+            for (int j=0; j <nb; ++j) {
+                for (int k=0; k <nb; ++k) {
+                    *(Cb(i,j)) += *(Ab(i,k)) * *(Bb(k,j));
+                }
+            }
+        }
+        end = high_resolution_clock::now();
+        duration_ = duration_cast<milliseconds>(end - start);
+        std::cout << "Block A*B elapsed: " << duration_.count() << "\n";
+		*/
+
+		/*
+        // First test
+        for (int i=0; i<nb; ++i) {
+            for (int j=0; j <nb; ++j) {
+                assert(*(Cb(i,j)) == C.block(i*b,j*b,b,b));
+            }
+        }
+		*/
+
+		/*
+        // Copy back for testing purposes
+        MatrixXd C0(n,n);
+        for (int i=0; i<nb; ++i) {
+            for (int j=0; j<nb; ++j) {
+                MatrixXd & M = *(Cb(i,j));
+                for (int i0=0; i0<b; ++i0) {
+                    for (int j0=0; j0<b; ++j0) {
+                        C0(i0+b*i,j0+b*j) = M(i0,j0);
+                    }
+                }
+            }
+        }
+		*/
+
+        // Second test
+        // assert(C == C0);
+
+        // Re-doing calculation using task task_map
 
         // Create thread team
         Thread_team team(n_thread);
 
-        chol_g.team = &team;
+        // Task flow context
+        struct Context {
+            Task_flow potf;
+            Task_flow trsm;
+			Task_flow gemm;
+            Context(Thread_team* a_tt) : potf(a_tt), trsm(a_tt), gemm(a_tt) {}
+        } ctx(&team);
+		
+		// POTF
+		
+		auto l_potf = [&] (int k) {
+			Eigen::LLT<Eigen::Ref<MatrixXd>> llt(*(Ab(k, k)));
+			for (int l = k + 1; l < nb; l++)
+			{
+				ctx.trsm.decrement_wait_count({l, 0, k});
+			}
+		};
+		
+		auto l_potf_wait_count = [&] (int k) 
+		{
+			return (k == 0) ? 0 : 1;
+		};
+		
+		ctx.potf = task_flow_init()
+		.task_init( [=] (int3& idx, Task* a_tsk) {
+			int wc = l_potf_wait_count(idx[2]);
+			a_tsk->init(bind(l_potf, idx[2]), wc);
+		})
+		.compute_on( [=] (int3& idx) {
+			return idx[2] % n_thread;
+		});
+		
+		// TRSM
+		
+		auto l_trsm = [&] (int i, int k) {
+			
+			*(Ab(i, k)) = Ab(k, k)->transpose().triangularView<Eigen::Upper>().solve<Eigen::OnTheRight>(*(Ab(i, k)));
+			for (int l = k + 1; l < nb; l++)
+			{
+				if (l >= i)
+				{
+					ctx.gemm.decrement_wait_count({l, i, k});
+				}
+				else
+				{
+					ctx.gemm.decrement_wait_count({i, l, k});
+				}
+			}
+		};
+		
+		auto l_trsm_wait_count = [&] (int i, int k)
+		{
+			return (k == 0) ? 1 : 2;
+		};
+		
+		ctx.trsm = task_flow_init()
+		.task_init( [=] (int3& idx, Task* a_tsk) {
+			int wc = l_trsm_wait_count(idx[0], idx[2]);
+			a_tsk->init(bind(l_trsm, idx[0], idx[2]), wc);
+		})
+		.compute_on( [=] (int3& idx) {
+			return (idx[0] + nb * idx[1]) % n_thread;
+		});
+		
+		// GEMM
+		
+		auto l_gemm = [&] (int i, int j, int k) {
+			
+			*(Ab(i, j)) -= *(Ab(i, k)) * Ab(j, k)->transpose();
+			if (i == j && j == k + 1)
+			{
+				ctx.potf.decrement_wait_count({0, 0, k + 1});
+			}
+			else if (j == k + 1)
+			{
+				ctx.trsm.decrement_wait_count({i, 0, k + 1});
+			}
+			else
+			{
+				ctx.gemm.decrement_wait_count({i, j, k + 1});
+			}
+		};
+		
+		auto l_gemm_wait_count = [&] (int i, int j, int k)
+		{
+			int nReq = 1;
+			if (k > 0)
+			{
+				nReq++;
+			}
+			if (i != j)
+			{
+				nReq++;
+			}
+			return nReq;
+		};
+		
+		ctx.gemm = task_flow_init()
+		.task_init( [=] (int3& idx, Task* a_tsk) {
+			int wc = l_gemm_wait_count(idx[0], idx[1], idx[2]);
+			a_tsk->init(bind(l_gemm, idx[0], idx[1], idx[2]), wc);
+		})
+		.compute_on( [=] (int3& idx) {
+			return (idx[0] + nb * idx[1]) % n_thread;
+		});
+		
+		/*
+        // Init task
+        auto l_init = [&] (int i, int j) {
+            *(Ab(i,j)) = A.block(i*b,j*b,b,b);
+            for (int k=0; k<nb; ++k) {
+                ctx.gemm_g.decrement_wait_count({i,k,0});
+                ctx.gemm_g.decrement_wait_count({k,j,0});
+            }
+        };
 
+        ctx.init_mat = task_flow_init()
+        .task_init( [=] (int3& idx, Task* a_tsk) {
+            a_tsk->init( bind(l_init,idx[0],idx[1]),
+                           0);
+        })
+        .compute_on([=] (int3& idx) {
+            return ( ( idx[0] + nb * idx[1] ) % n_thread );
+        });
+
+        // GEMM task
+        auto l_gemm = [&] (int i, int j, int k) {
+            *(Cb(i,j)) += *(Ab(i,k)) * *(Bb(k,j)); // GEMM
+            if (k < nb - 1) {
+                ctx.gemm_g.decrement_wait_count({i,j,k+1});
+            }
+        };
+
+        auto l_gemm_wait_count = [&] (int k) {
+            return ( k == 0 ? 2*nb : 1);
+        };
+
+        ctx.gemm_g = task_flow_init()
+        .task_init( [=] (int3& idx, Task* a_tsk) {
+            int wait_count = l_gemm_wait_count( idx[2]);
+            a_tsk->init( bind(l_gemm,idx[0],idx[1],idx[2]),
+                         wait_count);
+        })
+        .compute_on([=] (int3& idx) {
+            return ( ( idx[0] + nb * idx[1] ) % n_thread );
+        });
+
+		*/
+		
         // Start team of threads
         team.start();
 
+#ifdef PROFILER
+        ProfilerStart("ctxx.pprof");
+#endif
         start = high_resolution_clock::now();
 
-        LOG("start");
-        // Create seed tasks in graph and start
-        chol_g.start();
+        // Create seed tasks and start
+		/*
+        for (int i=0; i<nb; ++i) {
+            for (int j=0; j<nb; ++j) {
+                ctx.init_mat.async({i,j,0});
+            }
+        }
+		*/
+		ctx.potf.async({0, 0, 0});
 
-        LOG("wait");
-        // Wait for all tasks to be posted
-        chol_g.wait();
-
-        LOG("join");
         // Wait for end of task queue execution
         team.join();
 
+#ifdef PROFILER
+        ProfilerStop();
+#endif
+
         end = high_resolution_clock::now();
         duration_ = duration_cast<milliseconds>(end - start);
-        //std::cout << "CTXX GEMM elapsed: " << duration_.count() << "\n";
+        std::cout << "CTXX GEMM elapsed: " << duration_.count() << "\n";
 
-        LOG("test");
-		
-		
 		for (int i = 0; i < nb; i++)
 		{
-			*chol_g.A(i, i) = chol_g.A(i, i)->triangularView<Lower>();
+			*(Ab(i, i)) = Ab(i, i)->triangularView<Eigen::Lower>();
 		}
 		for (int i = 0; i < nb; i++)
 		{
 			for (int j = i + 1; j < nb; j++)
 			{
-				*chol_g.A(i, j) = MatrixXd::Zero(b, b);
+				*(Ab(i, j)) = MatrixXd::Zero(b, b);
 			}
 		}
 		
-		MatrixXd B(n, n);
+		MatrixXd otherL(n, n);
 		for (int i = 0; i < nb; i++)
 		{
 			for (int j = 0; j < nb; j++)
@@ -925,34 +929,33 @@ void test()
 				{
 					for (int l = 0; l < b; l++)
 					{
-						B(i * b + k, j * b + l) = (*chol_g.A(i, j))(k, l);
+						otherL(i * b + k, j * b + l) = (*(Ab(i, j)))(k, l);
 					}
 				}
 			}
 		}
 		
-		// std::cout << "Real L: " << std::endl << L << std::endl;
-		// std::cout << "Test L: " << std::endl << B << std::endl;
-
+		/*
+		std::cout << "L:" << std::endl;
+		std::cout << L << std::endl;
+		
+		std::cout << "The L That My Program Made:" << std::endl;
+		std::cout << otherL << std::endl;
+		*/
+		
+		/*
         // Test output
         for (int i=0; i<nb; ++i) {
             for (int j=0; j <nb; ++j) {
-				MatrixXd error = *chol_g.A(i,j) - L.block(i*b,j*b,b,b);
-                for (int k = 0; k < b; k++)
-				{
-					for (int l = 0; l < b; l++)
-					{
-						if (error(k, l) > 1e-8)
-						{
-							std::cout << error(k, l) << std::endl;
-						}
-					}
-				}
+                assert(*(Cb(i,j)) == C.block(i*b,j*b,b,b));
+            }
+        }
+		*/
+
+        for (int i=0; i<nb; ++i) {
+            for (int j=0; j <nb; ++j) {
+                delete Ab(i,j);
             }
         }
     }
-	timeval end;
-	gettimeofday(&end, NULL);
-	double secondsElapsed = timeSubtract(end, start);
-	std::cout << "total time: " << secondsElapsed << " s" << std::endl;
 }
