@@ -3,7 +3,7 @@
 
 using namespace std;
 
-bool test();
+bool test(int n_thread);
 double timeSubtract(timeval t1, timeval t2);
 
 #endif

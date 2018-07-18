@@ -1,4 +1,4 @@
-#include "choleskytest.h"
+#include "darvecholesky.h"
 #include "unittests.h"
 #include <fstream>
 #include <iostream>
@@ -17,7 +17,7 @@ double timeSubtract(timeval t1, timeval t2)
 	return double(m1 - m2) / 1000000;
 }
 
-bool test()
+bool test(int n_thread)
 {
 	ifstream fin("tests/info.txt");
 	int NUM_TESTS;
@@ -38,56 +38,25 @@ bool test()
 		current >> size >> blockSize >> numBlocks;
 		cout << "Test " << i << " (" << size << "x" << size << " matrix, " << blockSize << "x" << blockSize << " blocks)" << ": ";
 		
-		vector<vector<MatrixXd>> test;
+		MatrixXd test(size, size);
 		MatrixXd testCopy(size, size);
 		for (int j = 0; j < size; j++)
 		{
-			if (j % blockSize == 0)
-			{
-				vector<MatrixXd> v;
-				test.push_back(v);
-			}
 			for (int k = 0; k < size; k++)
 			{
-				if (k % blockSize == 0 && j % blockSize == 0)
-				{
-					// cout << "start" << endl;
-					MatrixXd m(blockSize, blockSize);
-					test[j / blockSize].push_back(m);
-					// cout << "end" << endl;
-				}
-				int a = j / blockSize;
-				int b = k / blockSize;
-				int c = j % blockSize;
-				int d = k % blockSize;
-				// cout << "(" << a << ", " << b << ", " << c << ", " << d << ")" << endl;
-				current >> test[a][b](c, d);
-				testCopy(j, k) = test[a][b](c, d);
+				current >> test(j, k);
+				testCopy(j, k) = test(j, k);
 			}
 		}
 		
 		timeval start;
 		gettimeofday(&start, 0);
-		cholesky(test, numBlocks, blockSize);
+		cholesky(test, numBlocks, blockSize, n_thread);
 		timeval end;
 		gettimeofday(&end, 0);
 		double secElapsed = timeSubtract(end, start);
 		
-		MatrixXd conMatrix(size, size);
-		for (int j = 0; j < numBlocks; j++)
-		{
-			for (int k = 0; k < numBlocks; k++)
-			{
-				for (int l = 0; l < blockSize; l++)
-				{
-					for (int m = 0; m < blockSize; m++)
-					{
-						conMatrix(j * blockSize + l, k * blockSize + m) = test[j][k](l, m);
-					}
-				}
-			}
-		}
-		MatrixXd comp = conMatrix * conMatrix.transpose();
+		MatrixXd comp = test * test.transpose();
 		/*
 		cout << endl;
 		cout << comp << endl;

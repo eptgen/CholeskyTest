@@ -1,0 +1,1 @@
+g++ -I ../../Eigen darvecholesky.cpp unittests.cpp -o darvecholesky
