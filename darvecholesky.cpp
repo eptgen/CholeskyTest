@@ -1,12 +1,14 @@
 #include "darvecholesky.h"
-#include "../ctxx/ctxx/main.cpp"
+#include "dthread.cpp"
 #include "unittests.h"
 #include <string>
+#include <functional>
 
 using std::cout;
 using std::endl;
 using std::stoi;
 using std::string;
+using namespace std::placeholders;
 
 void cholesky(MatrixXd& A, int p, int b, int n_thread)
 {
@@ -87,12 +89,23 @@ void cholesky(MatrixXd& A, int p, int b, int n_thread)
 	
 	// POTF
 	
-	auto l_potf = [&] (int k) {
+	auto l_potf = [&] (int m_id, int i, int k) {
+		if (i == 1) {
+			return true;
+		}
 		Eigen::LLT<Eigen::Ref<MatrixXd>> llt(*(Ab(k, k)));
+		
+		// printf("potf %d on thread %d\n", k, m_id);
+		
 		for (int l = k + 1; l < nb; l++)
 		{
-			ctx.trsm.decrement_wait_count({l, 0, k});
+			ctx.trsm.decrement_wait_count({l, 0, k}, m_id);
 		}
+		if (k == nb - 1)
+		{
+			ctx.potf.decrement_wait_count({1, 0, nb - 1}, m_id);
+		}
+		return false;
 	};
 	
 	auto l_potf_wait_count = [&] (int k) 
@@ -103,28 +116,35 @@ void cholesky(MatrixXd& A, int p, int b, int n_thread)
 	ctx.potf = task_flow_init()
 	.task_init( [=] (int3& idx, Task* a_tsk) {
 		int wc = l_potf_wait_count(idx[2]);
-		a_tsk->init(bind(l_potf, idx[2]), wc);
+		a_tsk->init(bind(l_potf, _1, idx[0], idx[2]), wc);
 	})
 	.compute_on( [=] (int3& idx) {
 		return idx[2] % n_thread;
 	});
+	ctx.potf.finish = {1, 0, nb - 1};
 	
 	// TRSM
 	
-	auto l_trsm = [&] (int i, int k) {
+	auto l_trsm = [&] (int m_id, int i, int k) {
 		
 		*(Ab(i, k)) = Ab(k, k)->transpose().triangularView<Eigen::Upper>().solve<Eigen::OnTheRight>(*(Ab(i, k)));
+		
+		// printf("trsm %d %d on thread %d\n", i, k, m_id);
+		
 		for (int l = k + 1; l < nb; l++)
 		{
 			if (l >= i)
 			{
-				ctx.gemm.decrement_wait_count({l, i, k});
+				// printf("trsm %d %d is decrementing %d %d %d\n", i, k, l, i, k);
+				ctx.gemm.decrement_wait_count({l, i, k}, m_id);
 			}
 			else
 			{
-				ctx.gemm.decrement_wait_count({i, l, k});
+				// printf("trsm %d %d is decrementing %d %d %d\n", i, k, i, l, k);
+				ctx.gemm.decrement_wait_count({i, l, k}, m_id);
 			}
 		}
+		return false;
 	};
 	
 	auto l_trsm_wait_count = [&] (int i, int k)
@@ -135,7 +155,7 @@ void cholesky(MatrixXd& A, int p, int b, int n_thread)
 	ctx.trsm = task_flow_init()
 	.task_init( [=] (int3& idx, Task* a_tsk) {
 		int wc = l_trsm_wait_count(idx[0], idx[2]);
-		a_tsk->init(bind(l_trsm, idx[0], idx[2]), wc);
+		a_tsk->init(bind(l_trsm, _1, idx[0], idx[2]), wc);
 	})
 	.compute_on( [=] (int3& idx) {
 		return (idx[0] + nb * idx[1]) % n_thread;
@@ -143,21 +163,25 @@ void cholesky(MatrixXd& A, int p, int b, int n_thread)
 	
 	// GEMM
 	
-	auto l_gemm = [&] (int i, int j, int k) {
+	auto l_gemm = [&] (int m_id, int i, int j, int k) {
 		
 		*(Ab(i, j)) -= *(Ab(i, k)) * Ab(j, k)->transpose();
+		
+		// printf("gemm %d %d %d on thread %d\n", i, j, k, m_id);
+		
 		if (i == j && j == k + 1)
 		{
-			ctx.potf.decrement_wait_count({0, 0, k + 1});
+			ctx.potf.decrement_wait_count({0, 0, k + 1}, m_id);
 		}
 		else if (j == k + 1)
 		{
-			ctx.trsm.decrement_wait_count({i, 0, k + 1});
+			ctx.trsm.decrement_wait_count({i, 0, k + 1}, m_id);
 		}
 		else
 		{
-			ctx.gemm.decrement_wait_count({i, j, k + 1});
+			ctx.gemm.decrement_wait_count({i, j, k + 1}, m_id);
 		}
+		return false;
 	};
 	
 	auto l_gemm_wait_count = [&] (int i, int j, int k)
@@ -177,7 +201,7 @@ void cholesky(MatrixXd& A, int p, int b, int n_thread)
 	ctx.gemm = task_flow_init()
 	.task_init( [=] (int3& idx, Task* a_tsk) {
 		int wc = l_gemm_wait_count(idx[0], idx[1], idx[2]);
-		a_tsk->init(bind(l_gemm, idx[0], idx[1], idx[2]), wc);
+		a_tsk->init(bind(l_gemm, _1, idx[0], idx[1], idx[2]), wc);
 	})
 	.compute_on( [=] (int3& idx) {
 		return (idx[0] + nb * idx[1]) % n_thread;
