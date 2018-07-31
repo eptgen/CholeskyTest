@@ -27,7 +27,6 @@ bool test(int n_thread)
 	bool result = true;
 	for (int i = 1; i <= NUM_TESTS; i++)
 	{
-		
 		string fileName = "tests/";
 		fileName.append(to_string(i));
 		fileName.append(".txt");

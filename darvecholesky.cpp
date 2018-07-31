@@ -84,8 +84,8 @@ void cholesky(MatrixXd& A, int p, int b, int n_thread)
 		Task_flow potf;
 		Task_flow trsm;
 		Task_flow gemm;
-		Context(Thread_team* a_tt) : potf(a_tt), trsm(a_tt), gemm(a_tt) {}
-	} ctx(&team);
+		Context(Thread_team* a_tt, int nb) : potf(a_tt, nb, nb, nb), trsm(a_tt, nb, nb, nb), gemm(a_tt, nb, nb, nb) {}
+	} ctx(&team, nb);
 	
 	// POTF
 	
@@ -116,7 +116,8 @@ void cholesky(MatrixXd& A, int p, int b, int n_thread)
 	ctx.potf = task_flow_init()
 	.task_init( [=] (int3& idx, Task* a_tsk) {
 		int wc = l_potf_wait_count(idx[2]);
-		a_tsk->init(bind(l_potf, _1, idx[0], idx[2]), wc);
+		a_tsk->set_function(bind(l_potf, _1, idx[0], idx[2]));
+		return wc;
 	})
 	.compute_on( [=] (int3& idx) {
 		return idx[2] % n_thread;
@@ -155,7 +156,8 @@ void cholesky(MatrixXd& A, int p, int b, int n_thread)
 	ctx.trsm = task_flow_init()
 	.task_init( [=] (int3& idx, Task* a_tsk) {
 		int wc = l_trsm_wait_count(idx[0], idx[2]);
-		a_tsk->init(bind(l_trsm, _1, idx[0], idx[2]), wc);
+		a_tsk->set_function(bind(l_trsm, _1, idx[0], idx[2]));
+		return wc;
 	})
 	.compute_on( [=] (int3& idx) {
 		return (idx[0] + nb * idx[1]) % n_thread;
@@ -201,12 +203,12 @@ void cholesky(MatrixXd& A, int p, int b, int n_thread)
 	ctx.gemm = task_flow_init()
 	.task_init( [=] (int3& idx, Task* a_tsk) {
 		int wc = l_gemm_wait_count(idx[0], idx[1], idx[2]);
-		a_tsk->init(bind(l_gemm, _1, idx[0], idx[1], idx[2]), wc);
+		a_tsk->set_function(bind(l_gemm, _1, idx[0], idx[1], idx[2]));
+		return wc;
 	})
 	.compute_on( [=] (int3& idx) {
 		return (idx[0] + nb * idx[1]) % n_thread;
 	});
-	
 	
 	// Start team of threads
 	team.start();

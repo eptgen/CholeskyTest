@@ -124,28 +124,25 @@ double timeSub(timeval t1, timeval t2)
 }
 
 struct Task : public Base_task {
-    int m_wait_count; // Number of incoming edges/tasks
+    std::atomic_int m_wait_count; // Number of incoming edges/tasks
 
     float priority = 0.0; // task priority
 
-    bool m_delete = true;
+    bool m_delete = false;
     // whether the object should be deleted after running the function
     // to completion.
 
-    mutex mtx; // Protects concurrent access to m_wait_count
 
-    Task() {}
-
-    Task(Base_task a_f, int a_wcount = 0, float a_priority = 0.0, bool a_del = true) :
-        Base_task(a_f), m_wait_count(a_wcount), priority(a_priority), m_delete(a_del)
-    {}
+    Task()
+	{
+		m_wait_count.store(-1);
+	}
 
     ~Task() {};
 
-    void init(Base_task a_f, int a_wcount = 0, float a_priority = 0.0, bool a_del = true)
+    void set_function(Base_task a_f, float a_priority = 0.0, bool a_del = false)
     {
         Base_task::operator=(a_f);
-        m_wait_count = a_wcount;
         priority = a_priority;
         m_delete = a_del;
     }
@@ -275,6 +272,11 @@ struct Thread_prio {
             th.join();
         }
     }
+	
+	void notify()
+	{
+		cv.notify_one();
+	}
 
     ~Thread_prio()
     {
@@ -298,6 +300,7 @@ struct Thread_team : public vector<Thread_prio*> {
     vector<Thread_prio> v_thread;
     unsigned long n_thread_query = 16; // Optimization parameter
 	atomic_bool endMe;
+	std::atomic_int ntasks;
 	
     Thread_team(const int n_thread) : v_thread(n_thread)
     {
@@ -307,6 +310,7 @@ struct Thread_team : public vector<Thread_prio*> {
             v_thread[i].team = this;
             v_thread[i].m_id = static_cast<unsigned short>(i);
         }
+		ntasks.store(0);
     }
 	
 	Thread_prio* getThread(int i) {
@@ -339,6 +343,13 @@ struct Thread_team : public vector<Thread_prio*> {
 		// while (!(endMe.load())) {}
         for (auto& th : v_thread) th.join();
     }
+	
+	void wake_all()
+	{
+		if (atomic_fetch_sub(&ntasks, 1) == 0) {
+			for (auto& th : v_thread) th.notify();
+		}
+	}
 
     void spawn(const int a_id, Task * a_task, bool shouldStop = false)
     {
@@ -371,6 +382,7 @@ struct Thread_team : public vector<Thread_prio*> {
 		// }
 		*/
 		
+		ntasks++;
 		v_thread[a_id].spawn(a_task);
     }
 	
@@ -457,6 +469,7 @@ void Thread_prio::communicate() {
 void spin(Thread_prio * a_thread)
 {
     LOG(a_thread->m_id);
+	// printf("l-l-l-lezzgo\n");
     // std::unique_lock<std::mutex> lck(a_thread->mtx);
 	while (true) {
 		/*
@@ -478,14 +491,12 @@ void spin(Thread_prio * a_thread)
 			// printf("popping. new size: %d\n", a_thread->ready_queue.size());
 			a_thread->update_status();
 			a_thread->communicate();
-			// std::string str = std::to_string(a_thread->m_id);
-			// str += " is about to run a task broseph\n";
-			// str += "current # tasks: ";
-			// str += std::to_string(a_thread->ready_queue.size());
-			// str += "\n";
+			// printf("about to run a task brosef\n");
 			// std::cout << str;
 			// printf("get ready!!\n");
 			bool shouldStop = (*tsk)(a_thread->m_id);
+			// printf("done running said task\n");
+			--(a_thread->team->ntasks);
 			// printf("not this time, friend\n");
 			if (shouldStop) {
 				// std::cout << "attempting to stop\n";
@@ -523,36 +534,31 @@ void spin(Thread_prio * a_thread)
 	*/
 };
 
-namespace hash_array {
+struct Matrix3_task : vector<Task> {
+    int n0, n1, n2;
+    Matrix3_task() {};
+    Matrix3_task(int a_n0, int a_n1, int a_n2) : vector<Task>(a_n0*a_n1*a_n2),
+        n0(a_n0), n1(a_n1), n2(a_n2) {};
 
-inline void hash_combine(std::size_t& seed, int const& v)
-{
-    seed ^= std::hash<int>()(v) + 0x9e3779b9 + (seed<<6) + (seed>>2);
-}
-
-struct hash {
-    size_t
-    operator()(array<int,3> const& key) const
+    Task& operator()(int i, int j, int k)
     {
-        size_t seed = 0;
-        hash_combine(seed, key[0]);
-        hash_combine(seed, key[1]);
-        hash_combine(seed, key[2]);
-        return seed;
+        assert(i>=0 && i<n0);
+        assert(j>=0 && j<n1);
+        assert(k>=0 && k<n2);
+        return operator[](i + n0*(j + n1*k));
     }
 };
-
-}
 
 typedef array<int,3> int3;
 
 struct Task_flow {
 
-    typedef std::function<void(int3&,Task*)> Init_task;
+    typedef std::function<int(int3&,Task*)> Init_task;
     typedef std::function<int(int3&)> Map_task;
 
     Thread_team * team = nullptr;
 	int3 finish;
+	Matrix3_task task_grid;
 
     struct Init {
         // How to initialize a task
@@ -582,22 +588,11 @@ struct Task_flow {
         return *this;
     }
 
-    unordered_map< int3, Task*, hash_array::hash > task_map;
-
-    mutex mtx_graph, mtx_quiescence;
-    std::condition_variable cond_quiescence;
-
-    bool quiescence = false;
-    // true = all tasks have been posted and quiescence has been reached
-
-    int n_task_in_graph = 0;
-
-    Task_flow(Thread_team * a_team) : team(a_team) {}
+    Task_flow(Thread_team * a_team, int n0, int n1, int n2) : team(a_team), task_grid(n0, n1, n2) {}
 
     virtual ~Task_flow() {}
-
-    // Find a task in the task_map and return pointer
-    Task * find_task(int3&);
+	
+	void init_task(int3&);
 
     // spawn task with index
     void async(int3);
@@ -607,12 +602,6 @@ struct Task_flow {
     // Decrement the dependency counter and spawnspawn task if ready
     void decrement_wait_count(int3, int);
 
-    // Returns when all tasks have been posted
-    void wait()
-    {
-        std::unique_lock<std::mutex> lck(mtx_quiescence);
-        while (!quiescence) cond_quiescence.wait(lck);
-    }
 };
 
 Task_flow::Init task_flow_init()
@@ -620,33 +609,14 @@ Task_flow::Init task_flow_init()
     return Task_flow::Init();
 }
 
-Task * Task_flow::find_task(int3 & idx)
+void Task_flow::init_task(int3& idx)
 {
-    Task * t_ = nullptr;
-
-    std::unique_lock<std::mutex> lck(mtx_graph);
-
-    auto tsk = task_map.find(idx);
-
-    // Task exists
-    if (tsk != task_map.end()) {
-        t_ = tsk->second;
-    }
-    else {
-        // Task does not exist; create it
-        t_ = new Task;
-        task_map[idx] = t_; // Insert in task_map
-
-        m_task.init(idx,t_); // Initialize
-
-        ++n_task_in_graph; // Increment counter
-    }
-
-    lck.unlock();
-
-    assert(t_ != nullptr);
-
-    return t_;
+    Task& tsk = task_grid(idx[0],idx[1],idx[2]);
+    int wait_count = m_task.init(idx,&tsk);
+	// printf("initializing %d %d %d with wait_count %d\n", idx[0], idx[1], idx[2], wait_count);
+	// printf("wait_count of %d %d %d was then %d\n", idx[0], idx[1], idx[2], tsk.m_wait_count.load());
+	std::atomic_fetch_add(&(tsk.m_wait_count), wait_count + 2);
+	// printf("wait_count of %d %d %d is now %d\n", idx[0], idx[1], idx[2], tsk.m_wait_count.load());
 }
 
 void Task_flow::async(int3 idx, Task * a_tsk, int m_id)
@@ -664,46 +634,37 @@ void Task_flow::async(int3 idx, Task * a_tsk, int m_id)
 	*/
 	// printf("trying to spawn %d %d %d\n", idx[0], idx[1], idx[2]);
     team->spawn(/*task map*/ /* m_task.map(idx) */ m_id, a_tsk, shouldStop);
-
-    // Delete entry in task_map
-    std::unique_lock<std::mutex> lck(mtx_graph);
-
-    assert(task_map.find(idx) != task_map.end());
-    task_map.erase(idx);
-
-    -- n_task_in_graph; // Decrement counter
-    assert(n_task_in_graph >= 0);
-
-    // Signal if quiescence has been reached
-    if (n_task_in_graph == 0) {
-        lck.unlock();
-        std::unique_lock<std::mutex> lck(mtx_quiescence);
-        quiescence = true;
-        cond_quiescence.notify_one(); // Notify waiting thread
-    }
 }
 
 void Task_flow::async(int3 idx)
 {
-    Task * t_ = find_task(idx);
-    async(idx, t_, 0);
+	init_task(idx);
+	async(idx, &task_grid(idx[0], idx[1], idx[2]), 0);
 }
 
 void Task_flow::decrement_wait_count(int3 idx, int m_id)
 {
-    Task * t_ = find_task(idx);
-
-    // Decrement counter
-    std::unique_lock<std::mutex> lck(t_->mtx);
-    --(t_->m_wait_count);
-    assert(t_->m_wait_count >= 0);
+    assert(0 <= idx[0] && idx[0] < task_grid.n0);
+    assert(0 <= idx[1] && idx[1] < task_grid.n1);
+    assert(0 <= idx[2] && idx[2] < task_grid.n2);
 	
-	// printf("decrementing %d %d %d to %d\n", idx[0], idx[1], idx[2], t_->m_wait_count);
+    Task& tsk = task_grid(idx[0], idx[1], idx[2]);
+	
+	// decrement counter
+	int wait_count = std::atomic_fetch_sub(&(tsk.m_wait_count), 1);
 
-    if (t_->m_wait_count == 0) { // task is ready to run
+	if (wait_count == -1) {
+		init_task(idx);
+		// printf("before: wait_count of %d %d %d is %d\n", idx[0], idx[1], idx[2], tsk.m_wait_count.load());
+		wait_count = std::atomic_fetch_sub(&(tsk.m_wait_count), 1);
+	}
+	
+	// printf("decrementing wait count of %d %d %d to %d on thread %d\n", idx[0], idx[1], idx[2], tsk.m_wait_count.load(), m_id);
+	
+	wait_count--;
+    if (wait_count == 0) { // task is ready to run
 		
-        lck.unlock();
-        async(idx, t_, m_id);
+        async(idx, &tsk, m_id);
     }
 }
 
